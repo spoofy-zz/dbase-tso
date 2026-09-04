@@ -14,7 +14,7 @@ startup = "crt0"
 sources = ["src/dbase.c"]
 
 [deploy]
-target = "RVEZ001.DBASE.LOAD"
+target = "IBMUSER.DBASE.LOAD"
 
 [artifacts]
 loads = true

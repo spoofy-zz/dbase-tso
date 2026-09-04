@@ -26,7 +26,7 @@ MVS_USER="${MBT_MVS_USER:-RVEZ001}"
 MVS_PASS="${MBT_MVS_PASS:-}"
 MVS_PROTOCOL="${MBT_MVS_PROTOCOL:-http}"
 MVS_REJECT_UNAUTHORIZED="${MBT_MVS_REJECT_UNAUTHORIZED:-false}"
-MVS_HLQ="${MBT_MVS_HLQ:-RVEZ001}"
+MVS_HLQ="${MBT_MVS_HLQ:-IBMUSER}"
 
 DBASE_PDS="${DBASE_PDS:-${MVS_HLQ}.DBASE}"
 DBASE_LOADLIB="${DBASE_LOADLIB:-${DBASE_PDS}.LOAD}"
@@ -93,8 +93,8 @@ receive_loadlib() {
 
 	jcl="$(mktemp /tmp/dbase-receive.XXXXXX.jcl)"
 	sed \
-		-e "s/RVEZ001.MBT.XMIT.IN/${DBASE_XMIT_IN}/g" \
-		-e "s/RVEZ001.DBASE.LOAD/${DBASE_LOADLIB}/g" \
+		-e "s/IBMUSER.MBT.XMIT.IN/${DBASE_XMIT_IN}/g" \
+		-e "s/IBMUSER.DBASE.LOAD/${DBASE_LOADLIB}/g" \
 		-e "s/TSO003/${DBASE_LOAD_VOLUME}/g" \
 		jcl/RECEIVE.jcl > "$jcl"
 	echo "+ submit ${jcl}"
@@ -107,7 +107,7 @@ alloc_store() {
 
 	jcl="$(mktemp /tmp/dbase-alloc.XXXXXX.jcl)"
 	sed \
-		-e "s/RVEZ001.DBASE.KV/${DBASE_STORE}/g" \
+		-e "s/IBMUSER.DBASE.KV/${DBASE_STORE}/g" \
 		-e "s/TSO003/${DBASE_LOAD_VOLUME}/g" \
 		jcl/ALLOCVS.jcl > "$jcl"
 	echo "+ submit ${jcl}"

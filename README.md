@@ -46,13 +46,13 @@ The current backend is a VSAM KSDS allocated to DD name `DBASEV`.
 Default dataset:
 
 ```text
-RVEZ001.DBASE.KV
+IBMUSER.DBASE.KV
 ```
 
 Default IDCAMS allocation:
 
 ```jcl
-  DEFINE CLUSTER (NAME(RVEZ001.DBASE.KV) -
+  DEFINE CLUSTER (NAME(IBMUSER.DBASE.KV) -
          INDEXED -
          KEYS(64 0) -
          RECORDSIZE(1024 1024) -
@@ -60,8 +60,8 @@ Default IDCAMS allocation:
          SHAREOPTIONS(2 3) -
          UNIQUE -
          SPEED VOLUMES(TSO003)) -
-    DATA (NAME(RVEZ001.DBASE.KV.DATA)) -
-    INDEX (NAME(RVEZ001.DBASE.KV.INDEX))
+    DATA (NAME(IBMUSER.DBASE.KV.DATA)) -
+    INDEX (NAME(IBMUSER.DBASE.KV.INDEX))
 ```
 
 The KSDS is used as a fixed-record key/value store. The first 64 bytes are the
@@ -109,27 +109,27 @@ make package
 
 ## Deploy
 
-`.env` contains the Hercules/zOSMF settings for `RVEZ001`. It is ignored by
+`.env` contains the Hercules/zOSMF settings. It is ignored by
 Git because it contains the password.
 
 ```sh
 make deploy-mvs
 ```
 
-The deploy target builds `DBASE`, allocates `RVEZ001.DBASE.KV`, deploys
-`RVEZ001.DBASE.LOAD`, uploads source members to `RVEZ001.DBASE`, and installs
+The deploy target builds `DBASE`, allocates `IBMUSER.DBASE.KV`, deploys
+`IBMUSER.DBASE.LOAD`, uploads source members to `IBMUSER.DBASE`, and installs
 `SYS2.CMDPROC(DBASE)`.
 
 Important deploy outputs:
 
-- `RVEZ001.DBASE.LOAD(DBASE)` - interactive TSO module
-- `RVEZ001.DBASE.LOAD(DBBATCH)` - batch module
-- `RVEZ001.DBASE.KV` - VSAM table/record store
-- `RVEZ001.DBASE` - uploaded source/JCL PDS
+- `IBMUSER.DBASE.LOAD(DBASE)` - interactive TSO module
+- `IBMUSER.DBASE.LOAD(DBBATCH)` - batch module
+- `IBMUSER.DBASE.KV` - VSAM table/record store
+- `IBMUSER.DBASE` - uploaded source/JCL PDS
 - `SYS2.CMDPROC(DBASE)` - TSO CLIST launcher
 
 Warning: `make deploy-mvs` runs `jcl/ALLOCVS.jcl`, which resets
-`RVEZ001.DBASE.KV`. Any test data in that VSAM cluster is deleted during deploy.
+`IBMUSER.DBASE.KV`. Any test data in that VSAM cluster is deleted during deploy.
 
 ## TSO Use
 
