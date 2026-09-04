@@ -22,6 +22,7 @@ It supports a compact subset of dBASE-like commands:
 
 - `CREATE` defines a table and its fields.
 - `CREATE` supports `C`, `N`, `D`, and `L` field types.
+- `TABLES` lists defined tables in the VSAM store.
 - `USE` selects an existing table.
 - `APPEND` inserts a record with `FIELD=value` assignments.
 - `APPEND FROM ddname` imports pipe-delimited records from a DD.
@@ -143,6 +144,7 @@ Example session:
 
 ```text
 CREATE PEOPLE ID N 8 NAME C 24 AGE N 3 CITY C 16 ACTIVE L 1
+TABLES
 APPEND ID=1 NAME=ANA AGE=42 CITY=ZAGREB ACTIVE=Y
 APPEND ID=2 NAME=MARKO AGE=35 CITY=SPLIT ACTIVE=Y
 LIST
@@ -172,6 +174,8 @@ Expected output includes:
 
 ```text
 Table PEOPLE created with 5 fields
+Tables:
+  PEOPLE            5 fields
 Record 1 added
 Record 2 added
 RECNO ID       NAME                     AGE CITY             ACTIVE

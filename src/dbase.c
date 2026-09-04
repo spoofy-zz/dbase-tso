@@ -115,12 +115,17 @@ static int starts_word(const char *s, const char *word)
     return *s == '\0' || isspace((unsigned char)*s);
 }
 
+static int key_has_prefix(const char *key, const char *prefix, int prefix_len)
+{
+    return memcmp(key, prefix, prefix_len) == 0;
+}
+
 static void normalize_command_line(char *line)
 {
     static const char *cmds[] = {
         "HELP", "CREATE", "USE", "APPEND", "LIST", "BROWSE",
         "DISPLAY", "REPLACE", "DELETE", "PACK", "FIND", "LOCATE",
-        "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL",
+        "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL", "TABLES",
         "COPY", NULL
     };
     int i;
@@ -405,6 +410,64 @@ static int kv_delete(const char *key)
 #endif
 }
 
+static int kv_scan(const char *prefix, int prefix_len,
+                   int (*cb)(const char *key, const char *data, void *arg),
+                   void *arg)
+{
+#ifdef __MVS__
+    struct Rec rec;
+    char last_key[KEY_LEN];
+    int rc;
+    int have_last = 0;
+    if (!kv_open()) {
+        return 0;
+    }
+    memset(&rec, ' ', sizeof(rec));
+    rc = __vsstge(g_kv, &rec, sizeof(rec), (void *)prefix, prefix_len);
+    if (rc != 0) {
+        __vsclr(g_kv);
+        return 1;
+    }
+    if (key_has_prefix(rec.key, prefix, prefix_len)) {
+        char data[DATA_LEN + 1];
+        data_get(data, rec.data, sizeof(data));
+        if (!cb(rec.key, data, arg)) {
+            return 1;
+        }
+        memcpy(last_key, rec.key, KEY_LEN);
+        have_last = 1;
+    }
+    while ((rc = __vsread(g_kv, &rec, sizeof(rec), NULL, 0)) >= 0) {
+        char data[DATA_LEN + 1];
+        if (!key_has_prefix(rec.key, prefix, prefix_len)) {
+            break;
+        }
+        if (have_last && memcmp(last_key, rec.key, KEY_LEN) == 0) {
+            continue;
+        }
+        data_get(data, rec.data, sizeof(data));
+        if (!cb(rec.key, data, arg)) {
+            break;
+        }
+        memcpy(last_key, rec.key, KEY_LEN);
+        have_last = 1;
+    }
+    return rc == -2 ? 0 : 1;
+#else
+    int i;
+    for (i = 0; i < g_host_kv_count; i++) {
+        char data[DATA_LEN + 1];
+        if (key_has_prefix(g_host_kv[i].key, prefix, prefix_len)) {
+            data_get(data, g_host_kv[i].data, sizeof(data));
+            if (!cb(g_host_kv[i].key, data, arg)) {
+                break;
+            }
+        }
+    }
+    return 1;
+#endif
+}
+
 static int parse_table_def(const char *text, struct Table *t)
 {
     char buf[DATA_LEN + 1];
@@ -646,6 +709,7 @@ static void cmd_help(void)
     say("Commands:\n");
     say("  CREATE name field type len [field type len ...]\n");
     say("  Types: C char, N numeric, D date, L logical\n");
+    say("  TABLES\n");
     say("  USE name\n");
     say("  APPEND field=value [field=value ...]\n");
     say("  APPEND FROM ddname\n");
@@ -660,6 +724,40 @@ static void cmd_help(void)
     say("  GO TOP|BOTTOM|recno, GOTO recno, SKIP [n]\n");
     say("  COUNT\n");
     say("  QUIT\n");
+}
+
+struct TablesCtx {
+    int count;
+};
+
+static int tables_cb(const char *key, const char *data, void *arg)
+{
+    struct TablesCtx *ctx = (struct TablesCtx *)arg;
+    struct Table t;
+    (void)key;
+    if (parse_table_def(data, &t)) {
+        say("  %-16s %2d fields\n", t.name, t.field_count);
+        ctx->count++;
+    }
+    return 1;
+}
+
+static void cmd_tables(void)
+{
+    char prefix[KEY_LEN];
+    struct TablesCtx ctx;
+
+    memset(prefix, ' ', sizeof(prefix));
+    memcpy(prefix, "A|", 2);
+    ctx.count = 0;
+    say("Tables:\n");
+    if (!kv_scan(prefix, 2, tables_cb, &ctx)) {
+        say("? cannot scan VSAM store\n");
+        return;
+    }
+    if (ctx.count == 0) {
+        say("  none\n");
+    }
 }
 
 static void cmd_create(char *args)
@@ -1331,6 +1429,8 @@ static void dispatch(char *line)
 
     if (same_word(cmd, "HELP") || strcmp(cmd, "?") == 0) {
         cmd_help();
+    } else if (same_word(cmd, "TABLES")) {
+        cmd_tables();
     } else if (same_word(cmd, "CREATE")) {
         cmd_create(args);
     } else if (same_word(cmd, "USE")) {
@@ -1348,8 +1448,10 @@ static void dispatch(char *line)
     } else if (same_word(cmd, "DISPLAY")) {
         if (same_word(args, "STRUCTURE")) {
             cmd_structure();
+        } else if (same_word(args, "TABLES")) {
+            cmd_tables();
         } else {
-            say("? try DISPLAY STRUCTURE\n");
+            say("? try DISPLAY STRUCTURE or DISPLAY TABLES\n");
         }
     } else if (same_word(cmd, "REPLACE")) {
         cmd_replace(args);
