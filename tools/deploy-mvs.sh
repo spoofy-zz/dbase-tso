@@ -30,7 +30,7 @@ MVS_HLQ="${MBT_MVS_HLQ:-RVEZ001}"
 
 DBASE_PDS="${DBASE_PDS:-${MVS_HLQ}.DBASE}"
 DBASE_LOADLIB="${DBASE_LOADLIB:-${DBASE_PDS}.LOAD}"
-DBASE_STORE="${DBASE_STORE:-${DBASE_PDS}.TEXT}"
+DBASE_STORE="${DBASE_STORE:-${DBASE_PDS}.KV}"
 DBASE_XMIT_IN="${DBASE_XMIT_IN:-${MVS_HLQ}.MBT.XMIT.IN}"
 DBASE_LOAD_VOLUME="${DBASE_LOAD_VOLUME:-TSO003}"
 DBASE_CMDPROC="${DBASE_CMDPROC:-SYS2.CMDPROC}"
@@ -107,7 +107,7 @@ alloc_store() {
 
 	jcl="$(mktemp /tmp/dbase-alloc.XXXXXX.jcl)"
 	sed \
-		-e "s/RVEZ001.DBASE.TEXT/${DBASE_STORE}/g" \
+		-e "s/RVEZ001.DBASE.KV/${DBASE_STORE}/g" \
 		-e "s/TSO003/${DBASE_LOAD_VOLUME}/g" \
 		jcl/ALLOCVS.jcl > "$jcl"
 	echo "+ submit ${jcl}"
@@ -127,7 +127,7 @@ echo "CLIST:       ${DBASE_CMDPROC}(DBASE)"
 echo "+ make package"
 make package
 
-try_cmd zowe zos-files create data-set-partitioned "$DBASE_PDS" --size 15TRK "${ZOWE_CONN[@]}"
+try_cmd zowe zos-files create data-set-partitioned "$DBASE_PDS" --size 60TRK "${ZOWE_CONN[@]}"
 try_cmd zowe zos-files create data-set-partitioned "$DBASE_LOADLIB" --size 15TRK --record-format U --record-length 0 --block-size 6144 "${ZOWE_CONN[@]}"
 try_cmd zowe zos-files create data-set-sequential "$DBASE_XMIT_IN" --size 20TRK --record-format FB --record-length 80 --block-size 3120 "${ZOWE_CONN[@]}"
 alloc_store

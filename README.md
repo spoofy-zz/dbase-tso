@@ -6,7 +6,8 @@ written in C for the `cc370` toolchain and packaged/deployed with MBT.
 The goal is not to emulate every dBASE III/IV feature. This is a practical,
 retro-friendly table editor/query shell for TSO that lets you define simple
 tables, append records, list data, search text, replace fields, mark records as
-deleted, and pack the active records back together.
+deleted, recall them, navigate with a record pointer, import/export pipe-delimited
+data, and pack the active records back together.
 
 ## What It Does
 
@@ -20,52 +21,67 @@ DBASE/TSO 0.1 for MVS 3.8j - type HELP
 It supports a compact subset of dBASE-like commands:
 
 - `CREATE` defines a table and its fields.
+- `CREATE` supports `C`, `N`, `D`, and `L` field types.
 - `USE` selects an existing table.
 - `APPEND` inserts a record with `FIELD=value` assignments.
+- `APPEND FROM ddname` imports pipe-delimited records from a DD.
 - `LIST` displays active records.
 - `LIST ALL` also displays records marked as deleted.
+- `LIST FOR field=value` filters records by one field.
 - `DISPLAY STRUCTURE` shows the current table definition.
 - `FIND` searches all fields for text.
 - `REPLACE` changes fields in one record.
 - `DELETE` marks one record as deleted.
+- `RECALL` unmarks a deleted record.
 - `PACK` removes deleted records from the active record stream.
+- `GO`, `GOTO`, and `SKIP` move the current record pointer.
+- `COPY TO ddname` exports pipe-delimited records to a DD.
 - `COUNT` reports active and physical record counts.
 - `HELP`, `QUIT`, and `EXIT` do what their names imply.
 
 ## Storage Backend
 
-The current backend is a fixed-block sequential MVS dataset allocated to DD name
-`DBASED`.
+The current backend is a VSAM KSDS allocated to DD name `DBASEV`.
 
 Default dataset:
 
 ```text
-RVEZ001.DBASE.TEXT
+RVEZ001.DBASE.KV
 ```
 
-Default JCL allocation:
+Default IDCAMS allocation:
 
 ```jcl
-//DBASED   DD DSN=RVEZ001.DBASE.TEXT,DISP=(NEW,CATLG,DELETE),
-//            UNIT=SYSDA,VOL=SER=TSO003,SPACE=(TRK,(5,2)),
-//            DCB=(RECFM=FB,LRECL=384,BLKSIZE=6144)
+  DEFINE CLUSTER (NAME(RVEZ001.DBASE.KV) -
+         INDEXED -
+         KEYS(64 0) -
+         RECORDSIZE(1024 1024) -
+         RECORDS(16000 4000) -
+         SHAREOPTIONS(2 3) -
+         UNIQUE -
+         SPEED VOLUMES(TSO003)) -
+    DATA (NAME(RVEZ001.DBASE.KV.DATA)) -
+    INDEX (NAME(RVEZ001.DBASE.KV.INDEX))
 ```
 
-The file is used as a small line-oriented key/value store. Table definitions and
-records are serialized as text lines. On startup the program reads the store
-into memory. On each change it rewrites the store through `fopen("DBASED", "w")`.
+The KSDS is used as a fixed-record key/value store. The first 64 bytes are the
+key and the remaining 960 bytes hold serialized table metadata or row data.
 
-This backend was chosen because it is simple, visible from normal MVS tools, and
-works reliably under the `cc370` C runtime on TK5. An earlier VSAM KSDS backend
-was tested, but `clibvsam` writes returned `PUT RC=8` on this host, so the
-current implementation deliberately uses ordinary dataset I/O.
+Key families:
+
+- `A|table` stores the table definition.
+- `R|table|000001` and up store table records.
+
+The VSAM access layer uses the same `clibvsam` pattern as the MiniSQL/TSO
+project: `__vsopen`, `__vsread`, `__vswrit`, and `__vsdel`. The physical row
+count is derived by probing consecutive row keys, so there is no mutable count
+metadata record.
 
 Practical limits in this version:
 
-- up to 8 fields per table
+- up to 12 fields per table
 - up to 32 characters per field value
-- up to 240 records per table
-- up to 256 physical key/value entries in the store
+- up to 999 records per table
 
 These limits keep virtual storage usage modest for MVS 3.8j batch and TSO
 execution.
@@ -100,7 +116,7 @@ Git because it contains the password.
 make deploy-mvs
 ```
 
-The deploy target builds `DBASE`, allocates `RVEZ001.DBASE.TEXT`, deploys
+The deploy target builds `DBASE`, allocates `RVEZ001.DBASE.KV`, deploys
 `RVEZ001.DBASE.LOAD`, uploads source members to `RVEZ001.DBASE`, and installs
 `SYS2.CMDPROC(DBASE)`.
 
@@ -108,12 +124,12 @@ Important deploy outputs:
 
 - `RVEZ001.DBASE.LOAD(DBASE)` - interactive TSO module
 - `RVEZ001.DBASE.LOAD(DBBATCH)` - batch module
-- `RVEZ001.DBASE.TEXT` - table/record store
+- `RVEZ001.DBASE.KV` - VSAM table/record store
 - `RVEZ001.DBASE` - uploaded source/JCL PDS
 - `SYS2.CMDPROC(DBASE)` - TSO CLIST launcher
 
 Warning: `make deploy-mvs` runs `jcl/ALLOCVS.jcl`, which resets
-`RVEZ001.DBASE.TEXT`. Any test data in that dataset is deleted during deploy.
+`RVEZ001.DBASE.KV`. Any test data in that VSAM cluster is deleted during deploy.
 
 ## TSO Use
 
@@ -126,14 +142,18 @@ DBASE
 Example session:
 
 ```text
-CREATE PEOPLE ID 8 NAME 24 AGE 3
-APPEND ID=1 NAME=ANA AGE=42
-APPEND ID=2 NAME=MARKO AGE=35
+CREATE PEOPLE ID N 8 NAME C 24 AGE N 3 CITY C 16 ACTIVE L 1
+APPEND ID=1 NAME=ANA AGE=42 CITY=ZAGREB ACTIVE=Y
+APPEND ID=2 NAME=MARKO AGE=35 CITY=SPLIT ACTIVE=Y
 LIST
+LIST FOR CITY=SPLIT
 DISPLAY STRUCTURE
 FIND ANA
 REPLACE 2 NAME=IVAN
+GO TOP
+SKIP 1
 DELETE 1
+RECALL 1
 PACK
 QUIT
 ```
@@ -151,11 +171,11 @@ zowe zos-jobs submit local-file jcl/DBASE.jcl --wait-for-output \
 Expected output includes:
 
 ```text
-Table PEOPLE created with 3 fields
+Table PEOPLE created with 5 fields
 Record 1 added
 Record 2 added
-RECNO ID       NAME                     AGE
-    1 1        ANA                      42
-    2 2        MARKO                    35
-2 active records (2 physical)
+RECNO ID       NAME                     AGE CITY             ACTIVE
+    1 1        ANA                      42                   .
+    2 2        MARKO                    35  SPLIT            Y
+3 active records (3 physical)
 ```
