@@ -707,21 +707,21 @@ static int write_row(int seq, const char *row)
 static void cmd_help(void)
 {
     say("Commands:\n");
-    say("  CREATE name field type len [field type len ...]\n");
+    say("  CREATE name field type len (field type len ...)\n");
     say("  Types: C char, N numeric, D date, L logical\n");
     say("  TABLES\n");
     say("  USE name\n");
-    say("  APPEND field=value [field=value ...]\n");
+    say("  APPEND field=value (field=value ...)\n");
     say("  APPEND FROM ddname\n");
-    say("  COPY TO ddname [ALL]\n");
-    say("  LIST [ALL] [FOR field=value]\n");
+    say("  COPY TO ddname (ALL)\n");
+    say("  LIST (ALL) (FOR field=value)\n");
     say("  DISPLAY STRUCTURE\n");
-    say("  REPLACE recno field=value [field=value ...]\n");
+    say("  REPLACE recno field=value (field=value ...)\n");
     say("  DELETE recno\n");
-    say("  RECALL [recno]\n");
+    say("  RECALL (recno)\n");
     say("  PACK\n");
     say("  FIND text\n");
-    say("  GO TOP|BOTTOM|recno, GOTO recno, SKIP [n]\n");
+    say("  GO TOP|BOTTOM|recno, GOTO recno, SKIP (n)\n");
     say("  COUNT\n");
     say("  QUIT\n");
 }
