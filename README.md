@@ -25,17 +25,24 @@ It supports a compact subset of dBASE-like commands:
 - `TABLES` lists defined tables in the VSAM store.
 - `USE` selects an existing table.
 - `APPEND` inserts a record with `FIELD=value` assignments.
+- `APPEND BLANK` creates an empty record.
 - `APPEND FROM ddname` imports pipe-delimited records from a DD.
 - `LIST` displays active records.
 - `LIST ALL` also displays records marked as deleted.
-- `LIST FOR field=value` filters records by one field.
+- `LIST FOR field op value` filters records with `=`, `<>`, `!=`, `<`, `>`,
+  `<=`, or `>=`.
+- `DISPLAY` shows the current record.
 - `DISPLAY STRUCTURE` shows the current table definition.
 - `FIND` searches all fields for text.
 - `REPLACE` changes fields in one record.
-- `DELETE` marks one record as deleted.
-- `RECALL` unmarks a deleted record.
+- `REPLACE field WITH value FOR field op value` changes matching records.
+- `DELETE` marks one record, all records, or matching records as deleted.
+- `RECALL` unmarks one deleted record, all deleted records, or matching records.
 - `PACK` removes deleted records from the active record stream.
 - `GO`, `GOTO`, and `SKIP` move the current record pointer.
+- `LOCATE FOR` and `CONTINUE` search records with a saved condition.
+- `SUM` and `AVERAGE` aggregate numeric fields.
+- `ZAP` removes all records from the selected table but keeps its structure.
 - `COPY TO ddname` exports pipe-delimited records to a DD.
 - `COUNT` reports active and physical record counts.
 - `HELP`, `QUIT`, and `EXIT` do what their names imply.
@@ -152,10 +159,16 @@ LIST FOR CITY=SPLIT
 DISPLAY STRUCTURE
 FIND ANA
 REPLACE 2 NAME=IVAN
+REPLACE CITY WITH ZAGREB FOR NAME=ANA
+LOCATE FOR AGE>30
+CONTINUE
+SUM AGE
+AVERAGE AGE
 GO TOP
 SKIP 1
 DELETE 1
-RECALL 1
+DELETE FOR AGE<30
+RECALL ALL
 PACK
 QUIT
 ```
@@ -179,8 +192,11 @@ Tables:
 Record 1 added
 Record 2 added
 Record 2 replaced
+1 record(s) replaced
+Sum AGE = 104.00
+Average AGE = 34.67
 RECNO ID       NAME                     AGE CITY             ACTIVE
-    1 1        ANA                      42                   .
+    1 1        ANA                      42  ZAGREB           .
     2 2        IVAN                     35  SPLIT            Y
-3 active records (3 physical)
+4 active records (4 physical)
 ```
