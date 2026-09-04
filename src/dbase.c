@@ -1111,6 +1111,7 @@ static void cmd_structure(void)
 static void cmd_replace(char *args)
 {
     char *recno;
+    char *assigns;
     char row[DATA_LEN + 1];
     char body[DATA_LEN + 1];
     char vals[MAX_FIELDS][MAX_VALUE + 1];
@@ -1119,9 +1120,20 @@ static void cmd_replace(char *args)
     if (!require_table()) {
         return;
     }
-    recno = strtok(args, " ");
+    trim(args);
+    recno = args;
+    assigns = strchr(args, ' ');
+    if (assigns != NULL) {
+        *assigns = '\0';
+        assigns++;
+        trim(assigns);
+    }
     if (recno == NULL) {
         say("? recno missing\n");
+        return;
+    }
+    if (assigns == NULL || assigns[0] == '\0') {
+        say("? replacement field=value missing\n");
         return;
     }
     seq = atoi(recno);
@@ -1132,7 +1144,7 @@ static void cmd_replace(char *args)
     strncpy(body, row + 1, sizeof(body));
     body[sizeof(body) - 1] = '\0';
     split_values(body, vals);
-    if (!apply_assignments(NULL, vals)) {
+    if (!apply_assignments(assigns, vals)) {
         return;
     }
     join_values(vals, row, sizeof(row), 0);

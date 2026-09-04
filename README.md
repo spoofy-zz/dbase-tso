@@ -178,8 +178,9 @@ Tables:
   PEOPLE            5 fields
 Record 1 added
 Record 2 added
+Record 2 replaced
 RECNO ID       NAME                     AGE CITY             ACTIVE
     1 1        ANA                      42                   .
-    2 2        MARKO                    35  SPLIT            Y
+    2 2        IVAN                     35  SPLIT            Y
 3 active records (3 physical)
 ```
