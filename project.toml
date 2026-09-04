@@ -1,0 +1,20 @@
+[project]
+name    = "dbase-tso"
+version = "0.1.0"
+type    = "application"
+
+[[module]]
+name    = "DBASE"
+startup = "crt0"
+sources = ["src/dbasetso.c", "asm/dbtget.asm", "asm/dbtput.asm"]
+
+[[module]]
+name    = "DBBATCH"
+startup = "crt0"
+sources = ["src/dbase.c"]
+
+[deploy]
+target = "RVEZ001.DBASE.LOAD"
+
+[artifacts]
+loads = true

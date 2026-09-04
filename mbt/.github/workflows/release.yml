@@ -1,0 +1,176 @@
+# Reusable release workflow for mbt v2 (cc370 host build) projects.
+#
+# Triggered on version tags (v*). Builds + installs the cc370 toolchain,
+# runs `make package`, and creates a GitHub Release with dist/* as assets.
+# No MVS involved.
+#
+# Usage in consumer project (.github/workflows/release.yml):
+#
+#   on:
+#     push:
+#       tags: ["v*"]
+#
+#   jobs:
+#     release:
+#       uses: mvslovers/mbt/.github/workflows/release.yml@main
+#
+# The toolchain a release is built with is declared in the project's own
+# project.toml, so a published artifact links a *released* libc370 rather than
+# whatever its default branch held at that minute (issue #67):
+#
+#   [toolchain]
+#   libc370 = "1.0.2"   # bare version -> tag v1.0.2
+#   cc370   = "main"    # cc370 has no releases yet
+#
+# Both keys are optional and default to "main"; a project that declares nothing
+# behaves as before. build.yml deliberately ignores the section and stays on
+# main -- see the note there.
+#
+# Legacy (v1, mvsMF/JCL) projects use release-legacy.yml instead.
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      cc370_ref:
+        description: >-
+          cc370 git ref (branch, tag or SHA) to build the toolchain from.
+          Overrides [toolchain] cc370 in project.toml; empty = use it.
+        type: string
+        default: ""
+      libc370_ref:
+        description: >-
+          libc370 git ref (branch, tag or SHA) to build the sysroot from.
+          Overrides [toolchain] libc370 in project.toml; empty = use it.
+        type: string
+        default: ""
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # create the GitHub Release
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate tag matches project version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PROJECT_VERSION=$(python3 -c "import tomllib; \
+          print(tomllib.load(open('project.toml','rb'))['project']['version'])")
+          if [ "$TAG" != "$PROJECT_VERSION" ]; then
+            echo "[mbt] ERROR: tag v$TAG does not match project.toml version $PROJECT_VERSION"
+            exit 1
+          fi
+
+      - name: Resolve toolchain refs
+        env:
+          INPUT_CC370_REF: ${{ inputs.cc370_ref }}
+          INPUT_LIBC370_REF: ${{ inputs.libc370_ref }}
+        run: |
+          # CC370_REF / LIBC370_REF from [toolchain] in project.toml,
+          # defaulting to main. An unknown key there is a hard error, so a
+          # typo cannot silently produce an unpinned release build.
+          #
+          # This workflow is resolved from mbt@main, but the consumer's mbt
+          # submodule is pinned independently and may predate the resolver.
+          # Missing resolver + no declaration is exactly today's behaviour, so
+          # keep going; missing resolver + a declaration would silently ignore
+          # the pin, so stop and say what to do.
+          TC=mbt/scripts/mbttoolchain.py
+          if [ -f "$TC" ]; then
+            CC370_REF=$(python3 "$TC" --project project.toml --repo cc370)
+            LIBC370_REF=$(python3 "$TC" --project project.toml --repo libc370)
+          elif grep -qE '^[[:space:]]*\[toolchain\]' project.toml; then
+            echo "[mbt] ERROR: project.toml declares [toolchain], but the mbt" \
+                 "submodule predates the resolver ($TC is missing)." >&2
+            echo "[mbt] ERROR: bump the mbt submodule to pick it up." >&2
+            exit 2
+          else
+            echo "[mbt] no [toolchain] declared, toolchain floats on main"
+            CC370_REF=main
+            LIBC370_REF=main
+          fi
+          # An explicit workflow input overrides the declaration.
+          CC370_REF="${INPUT_CC370_REF:-$CC370_REF}"
+          LIBC370_REF="${INPUT_LIBC370_REF:-$LIBC370_REF}"
+          {
+            echo "CC370_REF=$CC370_REF"
+            echo "LIBC370_REF=$LIBC370_REF"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone toolchain (cc370 + libc370)
+        run: |
+          echo "[mbt] cc370   @ $CC370_REF"
+          echo "[mbt] libc370 @ $LIBC370_REF"
+          # fetch-by-ref rather than `clone --branch`, which cannot take a
+          # commit SHA. Still a depth-1 fetch, so cost is unchanged.
+          fetch_at() {   # $1 repo, $2 ref, $3 target dir
+            git init -q "$3"
+            git -C "$3" remote add origin "https://github.com/mvslovers/$1.git"
+            if ! git -C "$3" fetch -q --depth 1 origin "$2"; then
+              echo "[mbt] ERROR: $1: no such ref '$2'" >&2
+              exit 1
+            fi
+            git -C "$3" checkout -q --detach FETCH_HEAD
+          }
+          fetch_at cc370   "$CC370_REF"   /tmp/cc370
+          fetch_at libc370 "$LIBC370_REF" /tmp/libc370
+          echo "TC_KEY=$(git -C /tmp/cc370 rev-parse HEAD)-$(git -C /tmp/libc370 rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Cache toolchain (cc370 compiler + libc370 sysroot)
+        id: tc-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: cc370-${{ runner.os }}-${{ env.TC_KEY }}
+
+      - name: Build + install toolchain
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex
+          # 1. compiler + tools (cc370/as370/ld370/ar370)
+          make -C /tmp/cc370 install PREFIX="$HOME/.local"
+          export PATH="$HOME/.local/bin:$PATH"
+          # 2. libc370 sysroot (headers, crt*.o, libc.a, macros); built with cc370
+          make -C /tmp/libc370 install
+
+      - name: Add cc370 to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Dependencies
+        run: make deps
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Package
+        run: make package
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.ref_name }}"
+          # Delete every existing release for this tag (published or draft),
+          # by id, keeping the git tag. A prerelease re-pushes the same dev
+          # tag, so the release must be recreated cleanly; deleting by id
+          # also clears stale drafts that would cause 'already_exists'.
+          gh api "repos/${{ github.repository }}/releases" --paginate \
+            --jq ".[] | select(.tag_name==\"$TAG\") | .id" | while read -r id; do
+            [ -n "$id" ] && gh api -X DELETE "repos/${{ github.repository }}/releases/$id"
+          done
+          PRERELEASE=""
+          case "$TAG" in *-*) PRERELEASE="--prerelease" ;; esac
+          gh release create "$TAG" $PRERELEASE --title "$TAG" \
+            --generate-notes dist/*

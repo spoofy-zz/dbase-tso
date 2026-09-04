@@ -1,0 +1,460 @@
+"""Offline tests for scripts/mbttest.py -- the MVS test runner.
+
+Covers the pure pieces (no MVS contact): runner-JCL generation and per-step
+RC parsing. The end-to-end deploy+submit path is validated against a live
+system separately.
+"""
+
+import sys
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+
+import mbttest
+
+JC = "//MBTTEST  JOB (A),'T'"
+TESTLIB = "IBMUSER.REXX370.V1R0M0D.TESTLIB"
+LINKLIB = "IBMUSER.REXX370.V1R0M0D.LINKLIB"
+
+
+class GenRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.jcl, self.smap = mbttest._gen_runner(
+            JC, ["TSTTOKN", "TSTFIND"], TESTLIB, LINKLIB)
+
+    def test_batch_and_tso_step_per_test(self):
+        # 2 tests -> 2 batch (B01,B02) + 2 tso (T01,T02)
+        self.assertEqual(
+            {("TSTTOKN", "batch"), ("TSTFIND", "batch"),
+             ("TSTTOKN", "tso"), ("TSTFIND", "tso")},
+            set(self.smap.values()))
+        self.assertEqual(self.smap["B01"], ("TSTTOKN", "batch"))
+        self.assertEqual(self.smap["T01"], ("TSTTOKN", "tso"))
+
+    def test_batch_step_form(self):
+        self.assertIn("//B01     EXEC PGM=TSTTOKN,COND=EVEN,REGION=", self.jcl)
+
+    def test_tso_step_uses_ikjeft01_call(self):
+        self.assertIn("//T01     EXEC PGM=IKJEFT01", self.jcl)
+        self.assertIn(f" CALL '{TESTLIB}(TSTTOKN)'", self.jcl)
+
+    def test_steplib_concatenates_testlib_then_linklib(self):
+        self.assertIn(f"//STEPLIB  DD DSN={TESTLIB},DISP=SHR", self.jcl)
+        self.assertIn(f"//         DD DSN={LINKLIB},DISP=SHR", self.jcl)
+
+    def test_steplib_testlib_only_when_no_linklib(self):
+        # linklib=None (nothing deployed yet) -> STEPLIB is TESTLIB alone,
+        # no dangling concatenation DD.
+        jcl, _ = mbttest._gen_runner(JC, ["TSTTOKN"], TESTLIB, None)
+        self.assertIn(f"//STEPLIB  DD DSN={TESTLIB},DISP=SHR", jcl)
+        self.assertNotIn(",DISP=SHR\n//         DD DSN=", jcl)
+
+    def test_region_is_concrete_not_zero(self):
+        # MVS 3.8j needs a concrete REGION (0M -> 512K default -> S878)
+        self.assertNotIn("REGION=0M", self.jcl)
+        self.assertIn(f"REGION={mbttest.RUNNER_REGION}", self.jcl)
+
+
+class FixtureRunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.fix = {
+            "TSTLOAD": {
+                "pds": "IBMUSER.REXX370.FIX.TSTLOAD",
+                "dds": ["SYSEXEC", "ALTDD"],
+                "members": [("HELLO", "/* c */\nsay 'hi'\n"), ("EMPTY", "")],
+            }
+        }
+        self.jcl, self.smap = mbttest._gen_runner(
+            JC, ["TSTLOAD", "TSTTOKN"], TESTLIB, LINKLIB, self.fix)
+
+    def test_iebgener_load_step_per_member(self):
+        self.assertIn("EXEC PGM=IEBGENER", self.jcl)
+        self.assertIn("//SYSUT2   DD DSN=IBMUSER.REXX370.FIX.TSTLOAD(HELLO),DISP=SHR", self.jcl)
+        self.assertIn("//SYSUT2   DD DSN=IBMUSER.REXX370.FIX.TSTLOAD(EMPTY),DISP=SHR", self.jcl)
+
+    def test_dlm_lets_rexx_comment_pass(self):
+        # the '/* c */' content must survive (DLM moves the terminator off '/*')
+        self.assertIn(f"//SYSUT1   DD *,DLM={mbttest._FIX_DLM}", self.jcl)
+        self.assertIn("/* c */", self.jcl)
+
+    def test_both_dds_added_to_fixture_test_steps(self):
+        self.assertIn("//SYSEXEC  DD DSN=IBMUSER.REXX370.FIX.TSTLOAD,DISP=SHR", self.jcl)
+        self.assertIn("//ALTDD    DD DSN=IBMUSER.REXX370.FIX.TSTLOAD,DISP=SHR", self.jcl)
+
+    def test_non_fixture_test_gets_no_fixture_dd(self):
+        # TSTTOKN has no fixture -> no FIX.TSTLOAD DD leaks into its step
+        toks = self.jcl.split("//B02")[1].split("//T01")[0]  # TSTTOKN batch step
+        self.assertNotIn("FIX.TSTLOAD", toks)
+
+
+class PerLegParmTest(unittest.TestCase):
+    def setUp(self):
+        self.parms = {"TISTSO": {"batch": "0", "tso": "1"}}
+        self.jcl, _ = mbttest._gen_runner(
+            JC, ["TISTSO", "TSTTOKN"], TESTLIB, LINKLIB, None, self.parms)
+
+    def test_batch_parm_on_exec(self):
+        self.assertIn("//B01     EXEC PGM=TISTSO,COND=EVEN,REGION=", self.jcl)
+        self.assertIn(",PARM='0'", self.jcl)
+
+    def test_tso_arg_on_call(self):
+        self.assertIn(f" CALL '{TESTLIB}(TISTSO)' '1'", self.jcl)
+
+    def test_no_parm_test_unaffected(self):
+        # TSTTOKN has no parm -> plain EXEC and plain CALL
+        self.assertIn("//B02     EXEC PGM=TSTTOKN,COND=EVEN,REGION=", self.jcl)
+        self.assertIn(f" CALL '{TESTLIB}(TSTTOKN)'\n", self.jcl)
+
+
+class ResolveParmsTest(unittest.TestCase):
+    def test_per_leg_overrides_and_common(self):
+        proj = {"test": [
+            {"name": "TISTSO", "parm_batch": "0", "parm_tso": "1"},
+            {"name": "FOO", "parm": "X"},          # common -> both legs
+            {"name": "BAR"},                        # none
+        ]}
+        out = mbttest._resolve_parms(proj, ["TISTSO", "FOO", "BAR"])
+        self.assertEqual(out["TISTSO"], {"batch": "0", "tso": "1"})
+        self.assertEqual(out["FOO"], {"batch": "X", "tso": "X"})
+        self.assertNotIn("BAR", out)
+
+
+class ParseStepRcTest(unittest.TestCase):
+    def test_cond_code(self):
+        s = "IEF142I MBTTEST B01 - STEP WAS EXECUTED - COND CODE 0000"
+        self.assertEqual(mbttest._parse_step_rc(s, "MBTTEST", "B01"), (0, "CC"))
+
+    def test_cond_code_nonzero(self):
+        s = "IEF142I MBTTEST T01 - STEP WAS EXECUTED - COND CODE 0012"
+        self.assertEqual(mbttest._parse_step_rc(s, "MBTTEST", "T01"), (12, "CC"))
+
+    def test_abend(self):
+        s = "IEF450I MBTTEST B01 - ABEND S806 U0000 - TIME=15.54.28"
+        rc, st = mbttest._parse_step_rc(s, "MBTTEST", "B01")
+        self.assertEqual(rc, 9999)
+        self.assertIn("S806", st)
+
+    def test_missing(self):
+        self.assertEqual(mbttest._parse_step_rc("", "MBTTEST", "B01"),
+                         (None, "NO RC"))
+
+
+# -- Job-level failure (issue #74) -------------------------------------------
+#
+# When the job fails as a whole -- JES rejects it for a JCL error, or the poll
+# expires -- no step has an IEF142I/IEF450I/IEF272I line, every step parses as
+# NO RC, and the matrix used to print a full column of FAIL for tests of which
+# none was broken and none had run.  In httpd#170 that read like three broken
+# tests plus contagion inside the job and was chased through job splits, step
+# counts and MBT_TEST_TIMEOUT; the cause was a nine-character name.
+
+# The real thing, from the JESMSGLG/JESYSMSG of a rejected runner (httpd#180).
+JCL_ERROR_SPOOL = """--- JESMSGLG ---
+
+                                                J E S 2   J O B   L O G
+ 6.41.22 JOB 1028  $HASP373 MBTTEST  STARTED - INIT  1 - CLASS A - SYS MVSC
+ 6.41.22 JOB 1028  IEF452I MBTTEST  JOB NOT RUN - JCL ERROR
+ 6.41.22 JOB 1028  $HASP395 MBTTEST  ENDED
+--- JESYSMSG ---
+ STMT NO. MESSAGE
+        26 IEF642I EXCESSIVE PARAMETER LENGTH IN THE PGM FIELD
+"""
+
+RUNNER = "build/test-runner.jcl"
+SPOOLF = "build/test-runner.spool"
+
+
+def _rows(*legs):
+    """rows for one test from (rc, status) pairs: {'T': {'batch':…, 'tso':…}}."""
+    return {"TSTX": {"batch": legs[0], "tso": legs[1]}}
+
+
+class JobFailureTest(unittest.TestCase):
+    def _call(self, status, spool, rows, timeout=300):
+        return mbttest._job_failure(status, spool, rows, "MBTTEST", "JOB01028",
+                                    timeout, RUNNER, SPOOLF)
+
+    # -- fires only when nothing ran --
+
+    def test_jcl_error_reports_the_reason(self):
+        out = self._call("JCL ERROR", JCL_ERROR_SPOOL,
+                         _rows((None, "NO RC"), (None, "NO RC")))
+        self.assertIsNotNone(out)
+        head, details = out
+        self.assertIn("rejected", head)
+        self.assertIn("JOB01028", head)
+        # the line that actually names the cause must be in the output
+        self.assertTrue(any("IEF642I" in d for d in details), details)
+        self.assertTrue(any("EXCESSIVE PARAMETER LENGTH" in d for d in details))
+        self.assertTrue(any(RUNNER in d for d in details))
+
+    def test_jcl_error_detected_from_spool_when_status_disagrees(self):
+        # _parse_spool_rc searches the whole spool for COND CODE before it
+        # looks for IEF452I, so the status can say something else entirely.
+        out = self._call("CC", JCL_ERROR_SPOOL,
+                         _rows((None, "NO RC"), (None, "NO RC")))
+        self.assertIsNotNone(out)
+        self.assertIn("rejected", out[0])
+
+    def test_jcl_error_detected_from_status_when_spool_is_empty(self):
+        out = self._call("JCL ERROR", "",
+                         _rows((None, "NO RC"), (None, "NO RC")))
+        self.assertIsNotNone(out)
+        self.assertIn("rejected", out[0])
+
+    def test_timeout_says_timeout_not_failed_tests(self):
+        out = self._call("TIMEOUT", "", _rows((None, "NO RC"), (None, "NO RC")),
+                         timeout=420)
+        self.assertIsNotNone(out)
+        head, details = out
+        self.assertIn("420s", head)
+        self.assertTrue(any("MBT_TEST_TIMEOUT" in d for d in details))
+
+    def test_unexplained_empty_spool_still_names_the_job(self):
+        out = self._call("UNKNOWN", "", _rows((None, "NO RC"), (None, "NO RC")))
+        self.assertIsNotNone(out)
+        head, details = out
+        self.assertIn("no return code for any step", head)
+        self.assertTrue(any(SPOOLF in d for d in details))
+
+    # -- stays quiet whenever the steps did produce verdicts --
+
+    def test_all_steps_abended_is_test_level_not_job_level(self):
+        # Every step ABENDed -> IEF450I verdicts exist; that IS test-level
+        # information and the matrix must still print.
+        out = self._call("ABEND", "IEF450I ...",
+                         _rows((9999, "ABEND S806"), (9999, "ABEND S806")))
+        self.assertIsNone(out)
+
+    def test_partial_no_rc_still_prints_the_matrix(self):
+        out = self._call("CC", "IEF142I ...",
+                         _rows((0, "CC"), (None, "NO RC")))
+        self.assertIsNone(out)
+
+    def test_not_executed_is_a_verdict(self):
+        out = self._call("CC", "IEF272I ...",
+                         _rows((None, "NOT EXECUTED"), (None, "NOT EXECUTED")))
+        self.assertIsNone(out)
+
+    def test_empty_rows_never_reports(self):
+        # all() over nothing is True -- guard against a future refactor
+        # turning "no tests" into a spurious job-level failure.
+        self.assertIsNone(self._call("CC", "", {}))
+
+
+class HealthySpoolTest(unittest.TestCase):
+    """The negative control: a real 30-step runner spool from a green
+    `make test-mvs` (httpd) must not trip the job-level guard.
+
+    The fixture is that spool reduced to its JES/IEF system messages -- the
+    tests' own WTO output is what the runner ignores anyway, and it is not
+    this repo's to carry.
+    """
+
+    SPOOL = Path(__file__).parent / "fixtures" / "spool-healthy.txt"
+
+    def setUp(self):
+        self.spool = self.SPOOL.read_text()
+
+    def test_every_step_has_a_verdict(self):
+        rows = {}
+        for i in range(1, 16):
+            rows[f"T{i:02d}"] = {
+                "batch": mbttest._parse_step_rc(self.spool, "MBTTEST", f"B{i:02d}"),
+            }
+        statuses = {st for legs in rows.values() for (_rc, st) in legs.values()}
+        self.assertEqual(statuses, {"CC"}, "real spool did not parse as executed")
+
+    def test_guard_stays_quiet(self):
+        rows = {
+            f"T{i:02d}": {
+                "batch": mbttest._parse_step_rc(self.spool, "MBTTEST", f"B{i:02d}"),
+                "tso": mbttest._parse_step_rc(self.spool, "MBTTEST", f"T{i:02d}"),
+            }
+            for i in range(1, 16)
+        }
+        self.assertIsNone(
+            mbttest._job_failure("CC", self.spool, rows, "MBTTEST", "JOB01032",
+                                 300, RUNNER, SPOOLF))
+
+    def test_no_false_jcl_error_from_a_healthy_spool(self):
+        # The spool primitives themselves live in tests/test_spool.py; this is
+        # the one assertion that needs a real 30-step spool to mean anything.
+        self.assertIsNone(mbttest.JCL_ERROR_RE.search(self.spool))
+        self.assertEqual(mbttest.jcl_diagnostics(self.spool), [])
+
+
+class AssertionCountTest(unittest.TestCase):
+    def test_pass_fail_counting(self):
+        spool = "  PASS: a\n  PASS: b\n  FAIL: c\n=== 2/3 passed ===\n"
+        self.assertEqual(len(mbttest._PASS.findall(spool)), 2)
+        self.assertEqual(len(mbttest._FAIL.findall(spool)), 1)
+
+
+# -- Unreadable spool (issue #87) --------------------------------------------
+#
+# The jobs API could not return the spool: HTTP 500 on /files, and on the
+# per-DD /records calls.  The readback failure became an empty string, which
+# is what a job with no output produces, so the runner said "no test ran" for
+# a job whose every step had ended RC 0000 -- and mvsmf#282 went looking for
+# the fault in the harness and in the tests, where it was not.
+
+READBACK_ERR = ["HTTP 500 Internal Server Error for GET "
+                "/restjobs/jobs/MBTTEST/JOB01179/files"]
+
+# A per-DD failure. JESYSMSG is where the IEF142I verdicts live; SYSPRINT is
+# where they emphatically do not.
+JES_DD_ERR = ["JESYSMSG: HTTP 500 Internal Server Error for GET "
+              "/restjobs/jobs/MBTTEST/JOB01179/files/2/records"]
+SYSPRINT_ERR = ["SYSPRINT: HTTP 500 Internal Server Error for GET "
+                "/restjobs/jobs/MBTTEST/JOB01179/files/7/records"]
+
+NO_RC_ROWS = _rows((None, "NO RC"), (None, "NO RC"))
+
+
+class ReadbackFailureTest(unittest.TestCase):
+    def _call(self, status, spool, rows, errors, timeout=300):
+        return mbttest._job_failure(status, spool, rows, "MBTTEST", "JOB01179",
+                                    timeout, RUNNER, SPOOLF, errors)
+
+    def test_says_the_output_could_not_be_read_not_that_nothing_ran(self):
+        out = self._call("CC", "", NO_RC_ROWS, READBACK_ERR)
+        self.assertIsNotNone(out)
+        head, details = out
+        self.assertIn("could not be read", head)
+        self.assertNotIn("no test ran", head)
+        self.assertIn("JOB01179", head)
+        joined = " ".join(details)
+        self.assertIn("HTTP 500", joined)
+        self.assertIn("/files", joined)
+
+    def test_hints_at_the_console_where_the_rcs_survive(self):
+        # The whole point: this fires when the REST API is what is broken, so
+        # the workaround must not need it.  IEFACTRT puts the step RC in SYSLOG.
+        _head, details = self._call("CC", "", NO_RC_ROWS, READBACK_ERR)
+        joined = "\n".join(details)
+        self.assertIn("IEFACTRT", joined)
+        self.assertIn("$HASP165", joined)
+        self.assertIn("may well have passed", joined)
+
+    def test_the_rc_column_marker_lines_up_under_the_sample(self):
+        # A caret that points at the wrong field is worse than none.
+        _head, details = self._call("CC", "", NO_RC_ROWS, READBACK_ERR)
+        sample = next(d for d in details if "IEFACTRT B05" in d)
+        caret = next(d for d in details if "^^^^^" in d)
+        self.assertEqual(caret.index("^"), sample.index("00000/MBTTEST"))
+
+    def test_error_list_is_capped(self):
+        errs = [f"SYSPRINT{i}: HTTP 500" for i in range(40)]
+        _head, details = self._call("CC", "", NO_RC_ROWS, errs)
+        self.assertEqual(len([d for d in details if "HTTP 500" in d]),
+                         mbttest.MAX_SPOOL_ERRORS)
+        self.assertTrue(any("and 35 more" in d for d in details), details)
+
+    # -- ordering: the status endpoint answered, and it is the better fact --
+
+    def test_jcl_error_still_wins(self):
+        out = self._call("JCL ERROR", JCL_ERROR_SPOOL, NO_RC_ROWS, READBACK_ERR)
+        self.assertIn("rejected", out[0])
+
+    def test_timeout_still_wins(self):
+        out = self._call("TIMEOUT", "", NO_RC_ROWS, READBACK_ERR, timeout=420)
+        self.assertIn("420s", out[0])
+        self.assertNotIn("could not be read", out[0])
+
+    # -- and it stays out of the way of the state it was confused with --
+
+    def test_no_errors_still_reads_as_no_test_ran(self):
+        # A job that genuinely produced nothing, with a readback that worked.
+        out = self._call("UNKNOWN", "", NO_RC_ROWS, [])
+        self.assertIn("no return code for any step", out[0])
+
+    def test_absent_argument_keeps_the_old_behaviour(self):
+        out = mbttest._job_failure("UNKNOWN", "", NO_RC_ROWS, "MBTTEST",
+                                   "JOB01179", 300, RUNNER, SPOOLF)
+        self.assertIn("no return code for any step", out[0])
+
+    def test_verdicts_present_means_this_is_not_a_job_level_fault(self):
+        # A partial readback leaves some steps with verdicts -- _job_failure
+        # must stay quiet there and let _matrix mark the rest (see below).
+        out = self._call("CC", "IEF142I ...",
+                         _rows((0, "CC"), (None, "NO RC")), READBACK_ERR)
+        self.assertIsNone(out)
+
+    def test_no_spool_hint_when_nothing_was_read(self):
+        # The spool file is written unconditionally, so it is there -- empty.
+        # Pointing at it as if it held something sends the reader nowhere.
+        _head, details = self._call("CC", "", NO_RC_ROWS, READBACK_ERR)
+        self.assertEqual([d for d in details if SPOOLF in d], [])
+
+    def test_partial_spool_is_still_worth_pointing_at(self):
+        _head, details = self._call("CC", "--- JESMSGLG ---\n$HASP373",
+                                    NO_RC_ROWS, READBACK_ERR)
+        self.assertTrue(any(SPOOLF in d for d in details), details)
+
+
+class PartialReadbackMatrixTest(unittest.TestCase):
+    """The half of #87 that never reaches _job_failure.
+
+    When /files answers but individual /records calls 500, some steps carry
+    IEF142I verdicts and the job-level guard correctly stays quiet.  The
+    remaining cells then used to print `FAIL NO RC` and count towards the exit
+    code -- reporting tests that passed as broken because a REST call failed.
+    """
+
+    ROWS = {
+        "TSTA": {"batch": (0, "CC"), "tso": (0, "CC")},
+        "TSTB": {"batch": (None, "NO RC"), "tso": (None, "NO RC")},
+    }
+
+    def test_unread_cells_are_neither_pass_nor_fail(self):
+        lines, failed, unread = mbttest._matrix(self.ROWS, JES_DD_ERR)
+        self.assertEqual(failed, 0)
+        self.assertEqual(unread, 2)
+        self.assertTrue(any("??" in ln for ln in lines))
+        self.assertFalse(any("FAIL" in ln for ln in lines), lines)
+
+    def test_a_real_failure_alongside_is_still_a_failure(self):
+        rows = dict(self.ROWS, TSTC={"batch": (12, "CC"), "tso": (0, "CC")})
+        _lines, failed, unread = mbttest._matrix(rows, JES_DD_ERR)
+        self.assertEqual(failed, 1)
+        self.assertEqual(unread, 2)
+
+    def test_without_a_readback_failure_no_rc_is_still_a_failure(self):
+        # A step with no verdict in a spool that was read in full really is
+        # wrong -- #74's behaviour must not be softened by this.
+        lines, failed, unread = mbttest._matrix(self.ROWS, [])
+        self.assertEqual(failed, 2)
+        self.assertEqual(unread, 0)
+        self.assertTrue(any("FAIL NO RC" in ln for ln in lines), lines)
+
+    def test_a_lost_non_jes_dd_does_not_excuse_a_missing_verdict(self):
+        # The narrow case the coarse rule got wrong: SYSPRINT failing cannot
+        # remove an IEF142I line, so a step with no verdict is still broken
+        # (#74) and must not be waved through as unknown.
+        lines, failed, unread = mbttest._matrix(self.ROWS, SYSPRINT_ERR)
+        self.assertEqual((failed, unread), (2, 0))
+        self.assertTrue(any("FAIL NO RC" in ln for ln in lines), lines)
+
+    def test_a_lost_jes_dd_among_others_still_counts(self):
+        lines, _failed, unread = mbttest._matrix(
+            self.ROWS, SYSPRINT_ERR + JES_DD_ERR)
+        self.assertEqual(unread, 2)
+        self.assertTrue(any("??" in ln for ln in lines))
+
+    def test_abend_is_a_verdict_even_with_a_hole_in_the_spool(self):
+        rows = {"TSTA": {"batch": (9999, "ABEND S806"), "tso": (0, "CC")}}
+        lines, failed, unread = mbttest._matrix(rows, JES_DD_ERR)
+        self.assertEqual((failed, unread), (1, 0))
+        self.assertTrue(any("S806" in ln for ln in lines))
+
+    def test_clean_run_is_unchanged(self):
+        rows = {"TSTA": {"batch": (0, "CC"), "tso": (0, "CC")}}
+        lines, failed, unread = mbttest._matrix(rows, [])
+        self.assertEqual((failed, unread), (0, 0))
+        self.assertEqual(lines[2].rstrip(), "  TSTA       ok CC 0        ok CC 0")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,93 @@
+# Reusable build workflow for mbt v2 (cc370 host build) projects.
+#
+# No MVS: builds + installs the cc370 toolchain on the runner, then runs
+# the host build (compile -> link -> library). MVS is only touched by
+# `make deploy`, which CI does not run.
+#
+# Usage in consumer project (.github/workflows/build.yml):
+#
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#
+#   jobs:
+#     build:
+#       uses: mvslovers/mbt/.github/workflows/build.yml@main
+#
+# The toolchain floats on main here by design, and the [toolchain] section of
+# project.toml is deliberately NOT honoured: a PR built against the tip of
+# cc370/libc370 is the early warning that catches a toolchain regression before
+# it reaches a consumer. Pinning it here would hide the break until someone
+# bumped the version. release.yml is the one that pins, so a published artifact
+# stays reproducible (issue #67).
+#
+# Legacy (v1, mvsMF/JCL) projects use build-legacy.yml instead.
+
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      cc370_ref:
+        description: "cc370 git ref (branch or tag) to build the toolchain from"
+        type: string
+        default: "main"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Clone toolchain (cc370 + libc370)
+        run: |
+          git clone --depth 1 --branch "${{ inputs.cc370_ref }}" \
+            https://github.com/mvslovers/cc370.git /tmp/cc370
+          git clone --depth 1 \
+            https://github.com/mvslovers/libc370.git /tmp/libc370
+          echo "TC_KEY=$(git -C /tmp/cc370 rev-parse HEAD)-$(git -C /tmp/libc370 rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Cache toolchain (cc370 compiler + libc370 sysroot)
+        id: tc-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.local
+          key: cc370-${{ runner.os }}-${{ env.TC_KEY }}
+
+      - name: Build + install toolchain
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex
+          # 1. compiler + tools (cc370/as370/ld370/ar370)
+          make -C /tmp/cc370 install PREFIX="$HOME/.local"
+          export PATH="$HOME/.local/bin:$PATH"
+          # 2. libc370 sysroot (headers, crt*.o, libc.a, macros); built with cc370
+          make -C /tmp/libc370 install
+
+      - name: Add cc370 to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Dependencies
+        run: make deps
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build modules
+        run: make
+
+      - name: Build tests
+        run: make test
+
+      - name: Build library
+        run: make lib
