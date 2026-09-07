@@ -141,6 +141,7 @@ upload_member project.toml "$DBASE_PDS" PROJTOML
 upload_member jcl/ALLOCVS.jcl "$DBASE_PDS" ALLOCVS
 upload_member jcl/DBASE.jcl "$DBASE_PDS" RUNJCL
 upload_member jcl/RECEIVE.jcl "$DBASE_PDS" RECEIVE
+upload_member scripts/TESTDO.txt "$DBASE_PDS" SCRIPT
 upload_member README.md "$DBASE_PDS" README
 upload_member clist/DBASE.clist "$DBASE_CMDPROC" DBASE
 

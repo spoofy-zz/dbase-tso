@@ -46,6 +46,12 @@ It supports a compact subset of dBASE-like commands:
 - `INDEX ON field TO name` builds a simple VSAM-backed index.
 - `INDEXES`, `SET INDEX TO name`, and `SEEK value` use that index.
 - `SET RELATION TO field INTO table ON field` links parent and child tables.
+- `STORE value TO var` and `STORE var=value` define in-memory variables.
+- `&var` expands a memory variable inside later commands.
+- `? expression` prints a value or simple numeric expression.
+- `DISPLAY MEMORY` and `LIST MEMORY` show currently defined variables.
+- `DO ddname` or `DO dataset(member)` runs a command file.
+- Command files support `IF`, `ELSE`, `ENDIF`, `DO WHILE`, and `ENDDO`.
 - `COPY TO ddname` exports pipe-delimited records to a DD.
 - `COUNT` reports active and physical record counts.
 - `HELP`, `QUIT`, and `EXIT` do what their names imply.
@@ -85,6 +91,11 @@ Key families:
 - `K|table|index|value|recno` stores index entries.
 - `R|table|000001` and up store table records.
 
+Memory variables are process-local only. They are kept in the running TSO or
+batch address space, are useful for command files and repeated substitutions,
+and are not written to the VSAM cluster. Data tables, rows, index definitions,
+and index entries are the persistent VSAM-backed objects.
+
 The VSAM access layer uses the same `clibvsam` pattern as the MiniSQL/TSO
 project: `__vsopen`, `__vsread`, `__vswrit`, and `__vsdel`. The physical row
 count is derived by probing consecutive row keys, so there is no mutable count
@@ -94,6 +105,8 @@ Practical limits in this version:
 
 - up to 12 fields per table
 - up to 32 characters per field value
+- up to 32 memory variables per session
+- up to 200 lines per `DO` command file
 - up to 999 records per table
 
 These limits keep virtual storage usage modest for MVS 3.8j batch and TSO
@@ -139,6 +152,7 @@ Important deploy outputs:
 - `IBMUSER.DBASE.LOAD(DBBATCH)` - batch module
 - `IBMUSER.DBASE.KV` - VSAM table/record store
 - `IBMUSER.DBASE` - uploaded source/JCL PDS
+- `IBMUSER.DBASE(SCRIPT)` - sample `DO` command file
 - `SYS2.CMDPROC(DBASE)` - TSO CLIST launcher
 
 Warning: `make deploy-mvs` runs `jcl/ALLOCVS.jcl`, which resets
@@ -164,6 +178,10 @@ LIST FOR CITY=SPLIT
 DISPLAY STRUCTURE
 FIND ANA
 REPLACE 2 NAME=IVAN
+STORE IVAN TO NEWNAME
+STORE 0 TO LOOP
+DO IBMUSER.DBASE(SCRIPT)
+DISPLAY MEMORY
 REPLACE CITY WITH ZAGREB FOR NAME=ANA
 LOCATE FOR AGE>30
 CONTINUE
@@ -188,6 +206,31 @@ PACK
 QUIT
 ```
 
+Example command file, supplied as `IBMUSER.DBASE(SCRIPT)` by the deploy step:
+
+```text
+IF &NEWNAME=IVAN
+REPLACE 2 NAME=&NEWNAME
+ELSE
+REPLACE 2 NAME=BAD
+ENDIF
+DO WHILE &LOOP<2
+STORE &LOOP+1 TO LOOP
+ENDDO
+? &LOOP
+```
+
+In batch JCL, control-flow commands can also be written directly in `SYSIN`:
+
+```jcl
+//SYSIN    DD *
+STORE ANA TO NEWNAME
+IF &NEWNAME=ANA
+REPLACE NAME WITH &NEWNAME FOR ID=1
+ENDIF
+/*
+```
+
 ## Batch Smoke Test
 
 The batch smoke test runs `DBBATCH` with commands from `SYSIN`:
@@ -207,6 +250,13 @@ Tables:
 Record 1 added
 Record 2 added
 Record 2 replaced
+NEWNAME = IVAN
+LOOP = 0
+Record 2 replaced
+LOOP = 1
+LOOP = 2
+2
+Memory variables:
 1 record(s) replaced
 Sum AGE = 104.00
 Average AGE = 34.67

@@ -18,6 +18,10 @@ extern int dbtput(char *buf, int len) asm("DBTPUT");
 #define MAX_INDEXES 8
 #define MAX_VALUE 32
 #define MAX_ROWS 999
+#define MAX_VARS 32
+#define MAX_SCRIPT_LINES 200
+#define MAX_DO_DEPTH 4
+#define MAX_WHILE_DEPTH 16
 #define KEY_LEN 64
 #define DATA_LEN 960
 #define DB_DD "DBASEV"
@@ -57,6 +61,11 @@ struct RelationDef {
     char child_field[MAX_NAME + 1];
 };
 
+struct MemVar {
+    char name[MAX_NAME + 1];
+    char value[MAX_VALUE + 1];
+};
+
 static struct Table g_table;
 static int g_have_table = 0;
 static int g_recno = 0;
@@ -66,6 +75,12 @@ static int g_locate_recno = 0;
 static struct IndexDef g_index;
 static int g_have_index = 0;
 static struct RelationDef g_relation;
+static struct MemVar g_vars[MAX_VARS];
+static int g_var_count = 0;
+static int g_do_depth = 0;
+
+static void say(const char *fmt, ...);
+static int is_numeric_text(const char *s);
 
 #if defined(__MVS__) && defined(DBASE_TSO)
 static char g_out[MAX_LINE];
@@ -140,6 +155,226 @@ static int key_has_prefix(const char *key, const char *prefix, int prefix_len)
     return memcmp(key, prefix, prefix_len) == 0;
 }
 
+static int var_index(const char *name)
+{
+    char tmp[MAX_NAME + 1];
+    int i;
+
+    strncpy(tmp, name, MAX_NAME);
+    tmp[MAX_NAME] = '\0';
+    trim(tmp);
+    upcase(tmp);
+    for (i = 0; i < g_var_count; i++) {
+        if (same_word(g_vars[i].name, tmp)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static const char *var_value(const char *name)
+{
+    int ix = var_index(name);
+    if (ix < 0) {
+        return "";
+    }
+    return g_vars[ix].value;
+}
+
+static int set_var(const char *name, const char *value)
+{
+    int ix;
+    char vname[MAX_NAME + 1];
+
+    strncpy(vname, name, MAX_NAME);
+    vname[MAX_NAME] = '\0';
+    trim(vname);
+    if (vname[0] == '&') {
+        memmove(vname, vname + 1, strlen(vname));
+    }
+    upcase(vname);
+    if (vname[0] == '\0') {
+        say("? memory variable name missing\n");
+        return 0;
+    }
+    ix = var_index(vname);
+    if (ix < 0) {
+        if (g_var_count >= MAX_VARS) {
+            say("? too many memory variables\n");
+            return 0;
+        }
+        ix = g_var_count++;
+        strncpy(g_vars[ix].name, vname, MAX_NAME);
+        g_vars[ix].name[MAX_NAME] = '\0';
+    }
+    strncpy(g_vars[ix].value, value, MAX_VALUE);
+    g_vars[ix].value[MAX_VALUE] = '\0';
+    trim(g_vars[ix].value);
+    return 1;
+}
+
+static void expand_vars(char *line)
+{
+    char out[MAX_LINE];
+    int i = 0;
+    int j = 0;
+
+    while (line[i] != '\0' && j < MAX_LINE - 1) {
+        if (line[i] == '&') {
+            char name[MAX_NAME + 1];
+            const char *val;
+            int n = 0;
+            i++;
+            while ((isalnum((unsigned char)line[i]) || line[i] == '_') &&
+                   n < MAX_NAME) {
+                name[n++] = line[i++];
+            }
+            name[n] = '\0';
+            val = var_value(name);
+            while (*val != '\0' && j < MAX_LINE - 1) {
+                out[j++] = *val++;
+            }
+        } else {
+            out[j++] = line[i++];
+        }
+    }
+    out[j] = '\0';
+    strncpy(line, out, MAX_LINE);
+    line[MAX_LINE - 1] = '\0';
+}
+
+static void eval_value(const char *expr, char *out, int max)
+{
+    char buf[MAX_LINE];
+    char *op = NULL;
+    char *p;
+
+    strncpy(buf, expr, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+    expand_vars(buf);
+    for (p = buf + 1; *p != '\0'; p++) {
+        if (*p == '+' || *p == '-') {
+            op = p;
+            break;
+        }
+    }
+    if (op != NULL) {
+        char left[MAX_VALUE + 1];
+        char right[MAX_VALUE + 1];
+        long a;
+        long b;
+        int n = (int)(op - buf);
+        if (n > MAX_VALUE) {
+            n = MAX_VALUE;
+        }
+        strncpy(left, buf, n);
+        left[n] = '\0';
+        strncpy(right, op + 1, sizeof(right));
+        right[sizeof(right) - 1] = '\0';
+        trim(left);
+        trim(right);
+        if (is_numeric_text(left) && is_numeric_text(right)) {
+            a = atol(left);
+            b = atol(right);
+            if (*op == '+') {
+                snprintf(out, max, "%ld", a + b);
+            } else {
+                snprintf(out, max, "%ld", a - b);
+            }
+            return;
+        }
+    }
+    strncpy(out, buf, max);
+    out[max - 1] = '\0';
+    trim(out);
+}
+
+static int eval_condition(const char *expr)
+{
+    char buf[MAX_LINE];
+    char left[MAX_VALUE + 1];
+    char right[MAX_VALUE + 1];
+    char op[3];
+    char *value = NULL;
+    int i;
+
+    strncpy(buf, expr, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+    expand_vars(buf);
+    if (starts_word(buf, "IF")) {
+        memmove(buf, buf + 2, strlen(buf + 2) + 1);
+        trim(buf);
+    }
+    if (starts_word(buf, "WHILE")) {
+        memmove(buf, buf + 5, strlen(buf + 5) + 1);
+        trim(buf);
+    }
+    op[0] = '\0';
+    for (i = 0; buf[i] != '\0'; i++) {
+        if ((buf[i] == '<' || buf[i] == '>' || buf[i] == '!') &&
+            buf[i + 1] == '=') {
+            op[0] = buf[i];
+            op[1] = '=';
+            op[2] = '\0';
+            buf[i] = '\0';
+            value = buf + i + 2;
+            break;
+        }
+        if (buf[i] == '<' && buf[i + 1] == '>') {
+            strcpy(op, "<>");
+            buf[i] = '\0';
+            value = buf + i + 2;
+            break;
+        }
+        if (buf[i] == '=' || buf[i] == '<' || buf[i] == '>') {
+            op[0] = buf[i];
+            op[1] = '\0';
+            buf[i] = '\0';
+            value = buf + i + 1;
+            break;
+        }
+    }
+    if (value == NULL) {
+        trim(buf);
+        if (buf[0] == '\0') {
+            return 0;
+        }
+        if (is_numeric_text(buf)) {
+            return atol(buf) != 0;
+        }
+        return 1;
+    }
+    strncpy(left, buf, sizeof(left));
+    left[sizeof(left) - 1] = '\0';
+    strncpy(right, value, sizeof(right));
+    right[sizeof(right) - 1] = '\0';
+    trim(left);
+    trim(right);
+    if (is_numeric_text(left) && is_numeric_text(right)) {
+        long a = atol(left);
+        long b = atol(right);
+        if (strcmp(op, "=") == 0) return a == b;
+        if (strcmp(op, "<>") == 0 || strcmp(op, "!=") == 0) return a != b;
+        if (strcmp(op, ">") == 0) return a > b;
+        if (strcmp(op, "<") == 0) return a < b;
+        if (strcmp(op, ">=") == 0) return a >= b;
+        if (strcmp(op, "<=") == 0) return a <= b;
+        return 0;
+    }
+    if (strcmp(op, "=") == 0) return same_word(left, right);
+    if (strcmp(op, "<>") == 0 || strcmp(op, "!=") == 0) {
+        return !same_word(left, right);
+    }
+    i = strcmp(left, right);
+    if (strcmp(op, ">") == 0) return i > 0;
+    if (strcmp(op, "<") == 0) return i < 0;
+    if (strcmp(op, ">=") == 0) return i >= 0;
+    if (strcmp(op, "<=") == 0) return i <= 0;
+    return 0;
+}
+
 static void normalize_command_line(char *line)
 {
     static const char *cmds[] = {
@@ -147,7 +382,8 @@ static void normalize_command_line(char *line)
         "DISPLAY", "REPLACE", "DELETE", "PACK", "FIND", "LOCATE",
         "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL", "TABLES",
         "COPY", "LOCATE", "CONTINUE", "SUM", "AVERAGE", "ZAP",
-        "INDEX", "INDEXES", "SET", "SEEK", "RELATION", NULL
+        "INDEX", "INDEXES", "SET", "SEEK", "RELATION", "STORE",
+        "DO", "IF", "ELSE", "ENDIF", "WHILE", "ENDDO", NULL
     };
     int i;
     int j;
@@ -726,6 +962,7 @@ static void show_relation_for_parent(const char *parent_row);
 static int require_table(void);
 static void print_header(void);
 static void print_row(int seq, const char *row);
+static void dispatch(char *line);
 
 static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
 {
@@ -1079,6 +1316,9 @@ static void cmd_help(void)
     say("  SEEK value\n");
     say("  SET RELATION TO field INTO table ON field\n");
     say("  SET RELATION OFF, RELATION\n");
+    say("  STORE value TO var, STORE var=value, ? expression\n");
+    say("  DISPLAY MEMORY, LIST MEMORY\n");
+    say("  DO ddname or dataset(member) with IF/ELSE/ENDIF and DO WHILE/ENDDO\n");
     say("  ZAP\n");
     say("  GO TOP|BOTTOM|recno, GOTO recno, SKIP (n)\n");
     say("  COUNT\n");
@@ -2267,13 +2507,14 @@ static void cmd_append_from(char *args)
         say("? DD name missing\n");
         return;
     }
-    f = fopen(dd, "r");
 #ifdef __MVS__
-    if (!f) {
+    {
         char ddpath[MAX_NAME + 4];
         sprintf(ddpath, "DD:%s", dd);
         f = fopen(ddpath, "r");
     }
+#else
+    f = fopen(dd, "r");
 #endif
     if (!f) {
         say("? cannot open %s for input\n", dd);
@@ -2390,6 +2631,276 @@ static void cmd_copy_to(char *args)
     say("%d record(s) copied to %s\n", copied, dd);
 }
 
+static int is_comment_line(const char *line)
+{
+    return line[0] == '*' || starts_word(line, "NOTE");
+}
+
+static int line_starts(const char *line, const char *word)
+{
+    return starts_word(line, word);
+}
+
+static int skip_to_if_else_or_end(char lines[MAX_SCRIPT_LINES][MAX_LINE],
+                                  int count, int pc)
+{
+    int depth = 0;
+    int i;
+    for (i = pc + 1; i < count; i++) {
+        char tmp[MAX_LINE];
+        strncpy(tmp, lines[i], sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
+        trim(tmp);
+        if (tmp[0] == '\0' || is_comment_line(tmp)) {
+            continue;
+        }
+        if (line_starts(tmp, "IF")) {
+            depth++;
+        } else if (line_starts(tmp, "ENDIF")) {
+            if (depth == 0) {
+                return i;
+            }
+            depth--;
+        } else if (line_starts(tmp, "ELSE") && depth == 0) {
+            return i;
+        }
+    }
+    return count;
+}
+
+static int skip_to_endif(char lines[MAX_SCRIPT_LINES][MAX_LINE],
+                         int count, int pc)
+{
+    int depth = 0;
+    int i;
+    for (i = pc + 1; i < count; i++) {
+        char tmp[MAX_LINE];
+        strncpy(tmp, lines[i], sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
+        trim(tmp);
+        if (tmp[0] == '\0' || is_comment_line(tmp)) {
+            continue;
+        }
+        if (line_starts(tmp, "IF")) {
+            depth++;
+        } else if (line_starts(tmp, "ENDIF")) {
+            if (depth == 0) {
+                return i;
+            }
+            depth--;
+        }
+    }
+    return count;
+}
+
+static int skip_to_enddo(char lines[MAX_SCRIPT_LINES][MAX_LINE],
+                         int count, int pc)
+{
+    int depth = 0;
+    int i;
+    for (i = pc + 1; i < count; i++) {
+        char tmp[MAX_LINE];
+        strncpy(tmp, lines[i], sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
+        trim(tmp);
+        if (tmp[0] == '\0' || is_comment_line(tmp)) {
+            continue;
+        }
+        if (line_starts(tmp, "DO WHILE")) {
+            depth++;
+        } else if (line_starts(tmp, "ENDDO")) {
+            if (depth == 0) {
+                return i;
+            }
+            depth--;
+        }
+    }
+    return count;
+}
+
+static void run_script_lines(char lines[MAX_SCRIPT_LINES][MAX_LINE], int count)
+{
+    int pc;
+    int while_pc[MAX_WHILE_DEPTH];
+    char while_expr[MAX_WHILE_DEPTH][MAX_LINE];
+    int while_sp = 0;
+
+    for (pc = 0; pc < count; pc++) {
+        char line[MAX_LINE];
+        strncpy(line, lines[pc], sizeof(line));
+        line[sizeof(line) - 1] = '\0';
+        trim(line);
+        if (line[0] == '\0' || is_comment_line(line)) {
+            continue;
+        }
+        if (line_starts(line, "IF")) {
+            char *expr = line + 2;
+            trim(expr);
+            if (!eval_condition(expr)) {
+                pc = skip_to_if_else_or_end(lines, count, pc);
+            }
+            continue;
+        }
+        if (line_starts(line, "ELSE")) {
+            pc = skip_to_endif(lines, count, pc);
+            continue;
+        }
+        if (line_starts(line, "ENDIF")) {
+            continue;
+        }
+        if (line_starts(line, "DO WHILE")) {
+            char *expr = line + 8;
+            trim(expr);
+            if (!eval_condition(expr)) {
+                pc = skip_to_enddo(lines, count, pc);
+                continue;
+            }
+            if (while_sp >= MAX_WHILE_DEPTH) {
+                say("? too many nested DO WHILE blocks\n");
+                return;
+            }
+            while_pc[while_sp] = pc;
+            strncpy(while_expr[while_sp], expr, MAX_LINE);
+            while_expr[while_sp][MAX_LINE - 1] = '\0';
+            while_sp++;
+            continue;
+        }
+        if (line_starts(line, "ENDDO")) {
+            if (while_sp <= 0) {
+                say("? ENDDO without DO WHILE\n");
+                return;
+            }
+            if (eval_condition(while_expr[while_sp - 1])) {
+                pc = while_pc[while_sp - 1];
+            } else {
+                while_sp--;
+            }
+            continue;
+        }
+        if (same_word(line, "QUIT") || same_word(line, "EXIT")) {
+            break;
+        }
+        expand_vars(line);
+        dispatch(line);
+    }
+}
+
+static void cmd_do(char *args)
+{
+    char target[MAX_LINE];
+    char (*lines)[MAX_LINE];
+    FILE *f;
+    int count = 0;
+
+    trim(args);
+    if (starts_word(args, "WHILE")) {
+        say("? DO WHILE is only valid inside DO command files\n");
+        return;
+    }
+    if (args[0] == '\0') {
+        say("? command file DD name missing\n");
+        return;
+    }
+    strncpy(target, args, sizeof(target));
+    target[sizeof(target) - 1] = '\0';
+    trim(target);
+    if (g_do_depth >= MAX_DO_DEPTH) {
+        say("? DO nesting too deep\n");
+        return;
+    }
+#ifdef __MVS__
+    if (strchr(target, '.') != NULL || strchr(target, '(') != NULL) {
+        f = fopen(target, "r");
+    } else {
+        char ddpath[MAX_NAME + 4];
+        char dd[MAX_NAME + 1];
+        strncpy(dd, target, MAX_NAME);
+        dd[MAX_NAME] = '\0';
+        upcase(dd);
+        sprintf(ddpath, "DD:%s", dd);
+        f = fopen(ddpath, "r");
+    }
+#else
+    f = fopen(target, "r");
+#endif
+    if (!f) {
+        say("? cannot open command file %s\n", target);
+        return;
+    }
+    lines = (char (*)[MAX_LINE])malloc(MAX_SCRIPT_LINES * MAX_LINE);
+    if (lines == NULL) {
+        fclose(f);
+        say("? no memory for command file\n");
+        return;
+    }
+    while (count < MAX_SCRIPT_LINES &&
+           fgets(lines[count], MAX_LINE, f) != NULL) {
+        rtrim(lines[count]);
+        normalize_command_line(lines[count]);
+        count++;
+    }
+    fclose(f);
+    g_do_depth++;
+    run_script_lines(lines, count);
+    g_do_depth--;
+    free(lines);
+}
+
+static void cmd_store(char *args)
+{
+    char work[MAX_LINE];
+    char upper[MAX_LINE];
+    char value[MAX_VALUE + 1];
+    char *to;
+    char *eq;
+
+    strncpy(work, args, sizeof(work));
+    work[sizeof(work) - 1] = '\0';
+    trim(work);
+    eq = strchr(work, '=');
+    if (eq != NULL) {
+        *eq = '\0';
+        eval_value(eq + 1, value, sizeof(value));
+        if (set_var(work, value)) {
+            say("%s = %s\n", work, value);
+        }
+        return;
+    }
+    strncpy(upper, work, sizeof(upper));
+    upper[sizeof(upper) - 1] = '\0';
+    upcase(upper);
+    to = strstr(upper, " TO ");
+    if (to == NULL) {
+        say("? try STORE value TO var\n");
+        return;
+    }
+    work[to - upper] = '\0';
+    eval_value(work, value, sizeof(value));
+    if (set_var(work + (to - upper) + 4, value)) {
+        say("%s = %s\n", work + (to - upper) + 4, value);
+    }
+}
+
+static void cmd_display_memory(void)
+{
+    int i;
+    say("Memory variables:\n");
+    if (g_var_count == 0) {
+        say("  none\n");
+        return;
+    }
+    for (i = 0; i < g_var_count; i++) {
+        say("  %-16s %s\n", g_vars[i].name, g_vars[i].value);
+    }
+}
+
+static void cmd_question(char *args)
+{
+    char value[MAX_VALUE + 1];
+    eval_value(args, value, sizeof(value));
+    say("%s\n", value);
+}
+
 static void dispatch(char *line)
 {
     char *cmd;
@@ -2405,10 +2916,16 @@ static void dispatch(char *line)
         args = "";
     }
 
-    if (same_word(cmd, "HELP") || strcmp(cmd, "?") == 0) {
+    if (same_word(cmd, "HELP")) {
         cmd_help();
+    } else if (strcmp(cmd, "?") == 0) {
+        cmd_question(args);
     } else if (same_word(cmd, "TABLES")) {
         cmd_tables();
+    } else if (same_word(cmd, "STORE")) {
+        cmd_store(args);
+    } else if (same_word(cmd, "DO")) {
+        cmd_do(args);
     } else if (same_word(cmd, "INDEX")) {
         cmd_index(args);
     } else if (same_word(cmd, "INDEXES")) {
@@ -2442,7 +2959,11 @@ static void dispatch(char *line)
     } else if (same_word(cmd, "COPY")) {
         cmd_copy_to(args);
     } else if (same_word(cmd, "LIST") || same_word(cmd, "BROWSE")) {
-        cmd_list(args);
+        if (same_word(args, "MEMORY")) {
+            cmd_display_memory();
+        } else {
+            cmd_list(args);
+        }
     } else if (same_word(cmd, "DISPLAY")) {
         if (args[0] == '\0') {
             show_current();
@@ -2450,8 +2971,10 @@ static void dispatch(char *line)
             cmd_structure();
         } else if (same_word(args, "TABLES")) {
             cmd_tables();
+        } else if (same_word(args, "MEMORY")) {
+            cmd_display_memory();
         } else {
-            say("? try DISPLAY STRUCTURE or DISPLAY TABLES\n");
+            say("? try DISPLAY STRUCTURE, DISPLAY TABLES or DISPLAY MEMORY\n");
         }
     } else if (same_word(cmd, "REPLACE")) {
         cmd_replace(args);
@@ -2483,6 +3006,10 @@ static void dispatch(char *line)
         cmd_skip(args);
     } else if (same_word(cmd, "QUIT") || same_word(cmd, "EXIT")) {
         /* handled by main */
+    } else if (same_word(cmd, "IF") || same_word(cmd, "ELSE") ||
+               same_word(cmd, "ENDIF") || same_word(cmd, "ENDDO") ||
+               same_word(cmd, "WHILE")) {
+        say("? control flow is only available inside DO command files\n");
     } else {
         say("? unknown command: %s\n", cmd);
     }
@@ -2498,6 +3025,31 @@ int main(int argc, char **argv)
     if (!kv_open()) {
         say("? cannot open DD %s. Allocate the VSAM store first.\n", DB_DD);
     }
+#if !defined(DBASE_TSO)
+    {
+        char (*lines)[MAX_LINE];
+        int count = 0;
+
+        lines = (char (*)[MAX_LINE])malloc(MAX_SCRIPT_LINES * MAX_LINE);
+        if (lines == NULL) {
+            say("? no memory for SYSIN command file\n");
+            kv_close();
+            return 1;
+        }
+        while (count < MAX_SCRIPT_LINES &&
+               fgets(lines[count], MAX_LINE, stdin) != NULL) {
+            rtrim(lines[count]);
+            normalize_command_line(lines[count]);
+            count++;
+        }
+        run_script_lines(lines, count);
+        free(lines);
+        kv_close();
+        say("Bye\n");
+        flush_out();
+        return 0;
+    }
+#else
     for (;;) {
         say(". ");
         flush_out();
@@ -2513,9 +3065,11 @@ int main(int argc, char **argv)
                 break;
             }
         }
+        expand_vars(line);
         dispatch(line);
         flush_out();
     }
+#endif
     kv_close();
     say("Bye\n");
     flush_out();
