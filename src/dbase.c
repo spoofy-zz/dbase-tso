@@ -15,6 +15,7 @@ extern int dbtput(char *buf, int len) asm("DBTPUT");
 #define MAX_LINE 512
 #define MAX_NAME 16
 #define MAX_FIELDS 12
+#define MAX_INDEXES 8
 #define MAX_VALUE 32
 #define MAX_ROWS 999
 #define KEY_LEN 64
@@ -42,12 +43,29 @@ struct Rec {
     char data[DATA_LEN];
 };
 
+struct IndexDef {
+    char table[MAX_NAME + 1];
+    char name[MAX_NAME + 1];
+    char field[MAX_NAME + 1];
+};
+
+struct RelationDef {
+    int active;
+    char parent_table[MAX_NAME + 1];
+    char parent_field[MAX_NAME + 1];
+    char child_table[MAX_NAME + 1];
+    char child_field[MAX_NAME + 1];
+};
+
 static struct Table g_table;
 static int g_have_table = 0;
 static int g_recno = 0;
 static int g_store_rc = 0;
 static char g_locate_for[MAX_LINE];
 static int g_locate_recno = 0;
+static struct IndexDef g_index;
+static int g_have_index = 0;
+static struct RelationDef g_relation;
 
 #if defined(__MVS__) && defined(DBASE_TSO)
 static char g_out[MAX_LINE];
@@ -128,7 +146,8 @@ static void normalize_command_line(char *line)
         "HELP", "CREATE", "USE", "APPEND", "LIST", "BROWSE",
         "DISPLAY", "REPLACE", "DELETE", "PACK", "FIND", "LOCATE",
         "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL", "TABLES",
-        "COPY", "LOCATE", "CONTINUE", "SUM", "AVERAGE", "ZAP", NULL
+        "COPY", "LOCATE", "CONTINUE", "SUM", "AVERAGE", "ZAP",
+        "INDEX", "INDEXES", "SET", "SEEK", "RELATION", NULL
     };
     int i;
     int j;
@@ -253,6 +272,29 @@ static void make_key(char *out, const char *kind, const char *name, int seq)
     } else {
         sprintf(tmp, "%s|%-16.16s", mapped, name);
     }
+    memcpy(out, tmp, strlen(tmp));
+}
+
+static void make_name_key(char *out, const char *kind, const char *table,
+                          const char *name)
+{
+    char tmp[KEY_LEN + 1];
+    memset(out, ' ', KEY_LEN);
+    sprintf(tmp, "%s|%-16.16s|%-16.16s", kind, table, name);
+    memcpy(out, tmp, strlen(tmp));
+}
+
+static void make_index_key(char *out, const struct IndexDef *idx,
+                           const char *value, int seq)
+{
+    char tmp[KEY_LEN + 1];
+    char val[21];
+    strncpy(val, value, 20);
+    val[20] = '\0';
+    upcase(val);
+    memset(out, ' ', KEY_LEN);
+    sprintf(tmp, "K|%-16.16s|%-16.16s|%-20.20s|%06d",
+            idx->table, idx->name, val, seq);
     memcpy(out, tmp, strlen(tmp));
 }
 
@@ -552,7 +594,25 @@ static int load_table(const char *name)
     }
     g_have_table = 1;
     g_recno = 1;
+    g_have_index = 0;
     return 1;
+}
+
+static int load_table_def(const char *name, struct Table *t)
+{
+    char key[KEY_LEN];
+    char data[DATA_LEN + 1];
+    char uname[MAX_NAME + 1];
+
+    strncpy(uname, name, MAX_NAME);
+    uname[MAX_NAME] = '\0';
+    trim(uname);
+    upcase(uname);
+    make_key(key, "T", uname, -1);
+    if (!kv_get(key, data, sizeof(data))) {
+        return 0;
+    }
+    return parse_table_def(data, t);
 }
 
 static int is_numeric_text(const char *s)
@@ -662,6 +722,10 @@ static int field_index(const char *name)
 }
 
 static void split_values(char *row, char vals[MAX_FIELDS][MAX_VALUE + 1]);
+static void show_relation_for_parent(const char *parent_row);
+static int require_table(void);
+static void print_header(void);
+static void print_row(int seq, const char *row);
 
 static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
 {
@@ -669,6 +733,35 @@ static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
     strncpy(body, row + 1, sizeof(body));
     body[sizeof(body) - 1] = '\0';
     split_values(body, vals);
+}
+
+static void split_values_for(const struct Table *t, char *row,
+                             char vals[MAX_FIELDS][MAX_VALUE + 1])
+{
+    char *p;
+    int i;
+    for (i = 0; i < MAX_FIELDS; i++) {
+        vals[i][0] = '\0';
+    }
+    p = strtok(row, "|");
+    i = 0;
+    while (p != NULL && i < t->field_count) {
+        strncpy(vals[i], p, MAX_VALUE);
+        vals[i][MAX_VALUE] = '\0';
+        p = strtok(NULL, "|");
+        i++;
+    }
+}
+
+static int field_index_for(const struct Table *t, const char *name)
+{
+    int i;
+    for (i = 0; i < t->field_count; i++) {
+        if (same_word(t->fields[i].name, name)) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 static int compare_values(int field, const char *a, const char *op,
@@ -842,10 +935,115 @@ static char *find_for_clause(char *args)
     return NULL;
 }
 
+static void make_index_prefix(char *out, const struct IndexDef *idx,
+                              const char *value)
+{
+    char tmp[KEY_LEN + 1];
+    char val[21];
+    strncpy(val, value, 20);
+    val[20] = '\0';
+    upcase(val);
+    memset(out, ' ', KEY_LEN);
+    sprintf(tmp, "K|%-16.16s|%-16.16s|%-20.20s|",
+            idx->table, idx->name, val);
+    memcpy(out, tmp, strlen(tmp));
+}
+
+static void serialize_index_def(const struct IndexDef *idx, char *out, int max)
+{
+    snprintf(out, max, "%s|%s|%s", idx->table, idx->name, idx->field);
+}
+
+static int parse_index_def(const char *text, struct IndexDef *idx)
+{
+    char buf[DATA_LEN + 1];
+    char *p;
+
+    strncpy(buf, text, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    p = strtok(buf, "|");
+    if (p == NULL) {
+        return 0;
+    }
+    strncpy(idx->table, p, MAX_NAME);
+    idx->table[MAX_NAME] = '\0';
+    p = strtok(NULL, "|");
+    if (p == NULL) {
+        return 0;
+    }
+    strncpy(idx->name, p, MAX_NAME);
+    idx->name[MAX_NAME] = '\0';
+    p = strtok(NULL, "|");
+    if (p == NULL) {
+        return 0;
+    }
+    strncpy(idx->field, p, MAX_NAME);
+    idx->field[MAX_NAME] = '\0';
+    upcase(idx->table);
+    upcase(idx->name);
+    upcase(idx->field);
+    return 1;
+}
+
+static int load_index_def(const char *name, struct IndexDef *idx)
+{
+    char key[KEY_LEN];
+    char data[DATA_LEN + 1];
+    char iname[MAX_NAME + 1];
+
+    if (!require_table()) {
+        return 0;
+    }
+    strncpy(iname, name, MAX_NAME);
+    iname[MAX_NAME] = '\0';
+    trim(iname);
+    upcase(iname);
+    make_name_key(key, "I", g_table.name, iname);
+    if (!kv_get(key, data, sizeof(data))) {
+        return 0;
+    }
+    return parse_index_def(data, idx);
+}
+
+static int write_index_entry(const struct IndexDef *idx, int seq,
+                             const char *row)
+{
+    char vals[MAX_FIELDS][MAX_VALUE + 1];
+    char key[KEY_LEN];
+    char data[32];
+    int ix;
+
+    ix = field_index(idx->field);
+    if (ix < 0 || row[0] == '*') {
+        return 1;
+    }
+    row_values(row, vals);
+    if (vals[ix][0] == '\0') {
+        return 1;
+    }
+    make_index_key(key, idx, vals[ix], seq);
+    sprintf(data, "%d", seq);
+    return kv_put(key, data);
+}
+
+static void update_active_index(int seq, const char *row)
+{
+    if (g_have_index && same_word(g_index.table, g_table.name)) {
+        write_index_entry(&g_index, seq, row);
+    }
+}
+
 static int read_row(int seq, char *row, int max)
 {
     char key[KEY_LEN];
     make_key(key, "R", g_table.name, seq);
+    return kv_get(key, row, max);
+}
+
+static int read_named_row(const char *table, int seq, char *row, int max)
+{
+    char key[KEY_LEN];
+    make_key(key, "R", table, seq);
     return kv_get(key, row, max);
 }
 
@@ -877,6 +1075,10 @@ static void cmd_help(void)
     say("  FIND text, LOCATE FOR field op value, CONTINUE\n");
     say("  SUM field (FOR field op value)\n");
     say("  AVERAGE field (FOR field op value)\n");
+    say("  INDEX ON field TO name, INDEXES, SET INDEX TO name\n");
+    say("  SEEK value\n");
+    say("  SET RELATION TO field INTO table ON field\n");
+    say("  SET RELATION OFF, RELATION\n");
     say("  ZAP\n");
     say("  GO TOP|BOTTOM|recno, GOTO recno, SKIP (n)\n");
     say("  COUNT\n");
@@ -915,6 +1117,294 @@ static void cmd_tables(void)
     if (ctx.count == 0) {
         say("  none\n");
     }
+}
+
+struct IndexesCtx {
+    int count;
+};
+
+static int indexes_cb(const char *key, const char *data, void *arg)
+{
+    struct IndexesCtx *ctx = (struct IndexesCtx *)arg;
+    struct IndexDef idx;
+    (void)key;
+    if (parse_index_def(data, &idx)) {
+        say("  %-16s ON %s\n", idx.name, idx.field);
+        ctx->count++;
+    }
+    return 1;
+}
+
+static void cmd_indexes(void)
+{
+    char prefix[KEY_LEN];
+    char tmp[KEY_LEN + 1];
+    struct IndexesCtx ctx;
+
+    if (!require_table()) {
+        return;
+    }
+    memset(prefix, ' ', sizeof(prefix));
+    sprintf(tmp, "I|%-16.16s|", g_table.name);
+    memcpy(prefix, tmp, strlen(tmp));
+    ctx.count = 0;
+    say("Indexes for %s:\n", g_table.name);
+    if (!kv_scan(prefix, (int)strlen(tmp), indexes_cb, &ctx)) {
+        say("? cannot scan indexes\n");
+        return;
+    }
+    if (ctx.count == 0) {
+        say("  none\n");
+    }
+}
+
+static void cmd_index(char *args)
+{
+    struct IndexDef idx;
+    char key[KEY_LEN];
+    char data[DATA_LEN + 1];
+    char field[MAX_NAME + 1];
+    char name[MAX_NAME + 1];
+    char *to;
+    char upper[MAX_LINE];
+    int ix;
+    int i;
+    int count;
+    int entries = 0;
+    char row[DATA_LEN + 1];
+
+    if (!require_table()) {
+        return;
+    }
+    trim(args);
+    if (starts_word(args, "ON")) {
+        memmove(args, args + 2, strlen(args + 2) + 1);
+        trim(args);
+    }
+    strncpy(upper, args, sizeof(upper));
+    upper[sizeof(upper) - 1] = '\0';
+    upcase(upper);
+    to = strstr(upper, " TO ");
+    if (to == NULL) {
+        say("? try INDEX ON field TO name\n");
+        return;
+    }
+    args[to - upper] = '\0';
+    strncpy(field, args, MAX_NAME);
+    field[MAX_NAME] = '\0';
+    trim(field);
+    upcase(field);
+    strncpy(name, args + (to - upper) + 4, MAX_NAME);
+    name[MAX_NAME] = '\0';
+    trim(name);
+    upcase(name);
+    ix = field_index(field);
+    if (ix < 0 || name[0] == '\0') {
+        say("? bad index definition\n");
+        return;
+    }
+    memset(&idx, 0, sizeof(idx));
+    strncpy(idx.table, g_table.name, MAX_NAME);
+    strncpy(idx.name, name, MAX_NAME);
+    strncpy(idx.field, field, MAX_NAME);
+    serialize_index_def(&idx, data, sizeof(data));
+    make_name_key(key, "I", idx.table, idx.name);
+    if (!kv_put(key, data)) {
+        say("? index metadata write failed rc=%d\n", g_store_rc);
+        return;
+    }
+    count = get_count(g_table.name);
+    for (i = 1; i <= count; i++) {
+        if (read_row(i, row, sizeof(row)) && row[0] != '*') {
+            char vals[MAX_FIELDS][MAX_VALUE + 1];
+            row_values(row, vals);
+            if (vals[ix][0] == '\0') {
+                continue;
+            }
+            if (!write_index_entry(&idx, i, row)) {
+                say("? index write failed rc=%d\n", g_store_rc);
+                return;
+            }
+            entries++;
+        }
+    }
+    g_index = idx;
+    g_have_index = 1;
+    say("Index %s on %s built with %d entries\n", name, field, entries);
+}
+
+struct SeekCtx {
+    struct IndexDef idx;
+    char value[MAX_VALUE + 1];
+    int found;
+};
+
+static int seek_cb(const char *key, const char *data, void *arg)
+{
+    struct SeekCtx *ctx = (struct SeekCtx *)arg;
+    char row[DATA_LEN + 1];
+    char vals[MAX_FIELDS][MAX_VALUE + 1];
+    int seq = atoi(data);
+    int ix;
+    (void)key;
+
+    if (seq < 1 || !read_row(seq, row, sizeof(row)) || row[0] == '*') {
+        return 1;
+    }
+    ix = field_index(ctx->idx.field);
+    if (ix < 0) {
+        return 0;
+    }
+    row_values(row, vals);
+    if (!same_word(vals[ix], ctx->value)) {
+        return 1;
+    }
+    g_recno = seq;
+    ctx->found = 1;
+    print_header();
+    print_row(seq, row);
+    show_relation_for_parent(row);
+    return 0;
+}
+
+static void cmd_set_index(char *args)
+{
+    char name[MAX_NAME + 1];
+
+    trim(args);
+    if (starts_word(args, "TO")) {
+        memmove(args, args + 2, strlen(args + 2) + 1);
+        trim(args);
+    }
+    if (same_word(args, "OFF") || args[0] == '\0') {
+        g_have_index = 0;
+        say("Index off\n");
+        return;
+    }
+    strncpy(name, args, MAX_NAME);
+    name[MAX_NAME] = '\0';
+    trim(name);
+    upcase(name);
+    if (!load_index_def(name, &g_index)) {
+        say("? index not found: %s\n", name);
+        return;
+    }
+    g_have_index = 1;
+    say("Index %s active on %s\n", g_index.name, g_index.field);
+}
+
+static void cmd_seek(char *args)
+{
+    char prefix[KEY_LEN];
+    struct SeekCtx ctx;
+    int prefix_len;
+
+    if (!require_table()) {
+        return;
+    }
+    if (!g_have_index) {
+        say("? no active index; use SET INDEX TO name\n");
+        return;
+    }
+    trim(args);
+    if (args[0] == '\0') {
+        say("? seek value missing\n");
+        return;
+    }
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.idx = g_index;
+    strncpy(ctx.value, args, MAX_VALUE);
+    ctx.value[MAX_VALUE] = '\0';
+    trim(ctx.value);
+    make_index_prefix(prefix, &g_index, ctx.value);
+    prefix_len = 57;
+    if (!kv_scan(prefix, prefix_len, seek_cb, &ctx)) {
+        say("? seek failed\n");
+        return;
+    }
+    if (!ctx.found) {
+        say("? not found\n");
+    }
+}
+
+static void cmd_set_relation(char *args)
+{
+    char parent[MAX_NAME + 1];
+    char child[MAX_NAME + 1];
+    char child_field[MAX_NAME + 1];
+    char upper[MAX_LINE];
+    char *into;
+    char *on;
+    struct Table child_def;
+
+    if (!require_table()) {
+        return;
+    }
+    trim(args);
+    if (same_word(args, "OFF")) {
+        memset(&g_relation, 0, sizeof(g_relation));
+        say("Relation off\n");
+        return;
+    }
+    if (starts_word(args, "TO")) {
+        memmove(args, args + 2, strlen(args + 2) + 1);
+        trim(args);
+    }
+    strncpy(upper, args, sizeof(upper));
+    upper[sizeof(upper) - 1] = '\0';
+    upcase(upper);
+    into = strstr(upper, " INTO ");
+    on = strstr(upper, " ON ");
+    if (into == NULL || on == NULL || on < into) {
+        say("? try SET RELATION TO field INTO table ON field\n");
+        return;
+    }
+    args[into - upper] = '\0';
+    args[on - upper] = '\0';
+    strncpy(parent, args, MAX_NAME);
+    parent[MAX_NAME] = '\0';
+    strncpy(child, args + (into - upper) + 6, MAX_NAME);
+    child[MAX_NAME] = '\0';
+    strncpy(child_field, args + (on - upper) + 4, MAX_NAME);
+    child_field[MAX_NAME] = '\0';
+    trim(parent);
+    trim(child);
+    trim(child_field);
+    upcase(parent);
+    upcase(child);
+    upcase(child_field);
+    if (field_index(parent) < 0) {
+        say("? parent field not found: %s\n", parent);
+        return;
+    }
+    if (!load_table_def(child, &child_def)) {
+        say("? child table not found: %s\n", child);
+        return;
+    }
+    if (field_index_for(&child_def, child_field) < 0) {
+        say("? child field not found: %s\n", child_field);
+        return;
+    }
+    memset(&g_relation, 0, sizeof(g_relation));
+    g_relation.active = 1;
+    strncpy(g_relation.parent_table, g_table.name, MAX_NAME);
+    strncpy(g_relation.parent_field, parent, MAX_NAME);
+    strncpy(g_relation.child_table, child, MAX_NAME);
+    strncpy(g_relation.child_field, child_field, MAX_NAME);
+    say("Relation %s.%s -> %s.%s active\n", g_relation.parent_table,
+        g_relation.parent_field, g_relation.child_table,
+        g_relation.child_field);
+}
+
+static void cmd_relation(void)
+{
+    if (!g_relation.active) {
+        say("No active relation\n");
+        return;
+    }
+    say("Relation %s.%s -> %s.%s\n", g_relation.parent_table,
+        g_relation.parent_field, g_relation.child_table,
+        g_relation.child_field);
 }
 
 static void cmd_create(char *args)
@@ -1075,6 +1565,7 @@ static void cmd_append(char *args)
             return;
         }
         g_recno = count + 1;
+        update_active_index(g_recno, row);
         say("Blank record %d added\n", count + 1);
         return;
     }
@@ -1092,6 +1583,7 @@ static void cmd_append(char *args)
         return;
     }
     g_recno = count + 1;
+    update_active_index(g_recno, row);
     say("Record %d added\n", count + 1);
 }
 
@@ -1118,6 +1610,77 @@ static void print_row(int seq, const char *row)
         say("%-*s ", g_table.fields[i].len, vals[i]);
     }
     say("\n");
+}
+
+static void print_row_for(const struct Table *t, int seq, const char *row)
+{
+    char tmp[DATA_LEN + 1];
+    char vals[MAX_FIELDS][MAX_VALUE + 1];
+    int i;
+    strncpy(tmp, row + 1, sizeof(tmp));
+    tmp[sizeof(tmp) - 1] = '\0';
+    split_values_for(t, tmp, vals);
+    say("%5d ", seq);
+    for (i = 0; i < t->field_count; i++) {
+        say("%-*s ", t->fields[i].len, vals[i]);
+    }
+    say("\n");
+}
+
+static void print_header_for(const struct Table *t)
+{
+    int i;
+    say("RECNO ");
+    for (i = 0; i < t->field_count; i++) {
+        say("%-*s ", t->fields[i].len, t->fields[i].name);
+    }
+    say("\n");
+}
+
+static void show_relation_for_parent(const char *parent_row)
+{
+    struct Table child;
+    char parent_vals[MAX_FIELDS][MAX_VALUE + 1];
+    char child_vals[MAX_FIELDS][MAX_VALUE + 1];
+    char row[DATA_LEN + 1];
+    char body[DATA_LEN + 1];
+    int parent_ix;
+    int child_ix;
+    int i;
+    int count;
+
+    if (!g_relation.active || !same_word(g_relation.parent_table,
+                                         g_table.name)) {
+        return;
+    }
+    if (!load_table_def(g_relation.child_table, &child)) {
+        say("? related table not found: %s\n", g_relation.child_table);
+        return;
+    }
+    parent_ix = field_index(g_relation.parent_field);
+    child_ix = field_index_for(&child, g_relation.child_field);
+    if (parent_ix < 0 || child_ix < 0) {
+        say("? relation field missing\n");
+        return;
+    }
+    row_values(parent_row, parent_vals);
+    count = get_count(child.name);
+    for (i = 1; i <= count; i++) {
+        if (!read_named_row(child.name, i, row, sizeof(row)) ||
+            row[0] == '*') {
+            continue;
+        }
+        strncpy(body, row + 1, sizeof(body));
+        body[sizeof(body) - 1] = '\0';
+        split_values_for(&child, body, child_vals);
+        if (same_word(parent_vals[parent_ix], child_vals[child_ix])) {
+            say("Related %s:\n", child.name);
+            print_header_for(&child);
+            print_row_for(&child, i, row);
+            return;
+        }
+    }
+    say("Related %s: not found\n", child.name);
 }
 
 static void cmd_list(char *args)
@@ -1177,6 +1740,7 @@ static void show_current(void)
     }
     print_header();
     print_row(g_recno, row);
+    show_relation_for_parent(row);
 }
 
 static void cmd_go(char *args)
@@ -1321,6 +1885,7 @@ static void cmd_replace(char *args)
             }
             changed++;
             g_recno = seq;
+            update_active_index(seq, row);
             if (!all && forp == NULL) {
                 break;
             }
@@ -1361,6 +1926,7 @@ static void cmd_replace(char *args)
         return;
     }
     g_recno = seq;
+    update_active_index(seq, row);
     say("Record %d replaced\n", seq);
 }
 
@@ -1548,6 +2114,7 @@ static int locate_from(int start, const char *expr)
             g_recno = i;
             print_header();
             print_row(i, row);
+            show_relation_for_parent(row);
             return 1;
         }
     }
@@ -1747,6 +2314,7 @@ static void cmd_append_from(char *args)
             return;
         }
         g_recno = count + 1;
+        update_active_index(g_recno, row);
         added++;
     }
     fclose(f);
@@ -1841,6 +2409,26 @@ static void dispatch(char *line)
         cmd_help();
     } else if (same_word(cmd, "TABLES")) {
         cmd_tables();
+    } else if (same_word(cmd, "INDEX")) {
+        cmd_index(args);
+    } else if (same_word(cmd, "INDEXES")) {
+        cmd_indexes();
+    } else if (same_word(cmd, "SEEK")) {
+        cmd_seek(args);
+    } else if (same_word(cmd, "RELATION")) {
+        cmd_relation();
+    } else if (same_word(cmd, "SET")) {
+        if (starts_word(args, "INDEX")) {
+            memmove(args, args + 5, strlen(args + 5) + 1);
+            trim(args);
+            cmd_set_index(args);
+        } else if (starts_word(args, "RELATION")) {
+            memmove(args, args + 8, strlen(args + 8) + 1);
+            trim(args);
+            cmd_set_relation(args);
+        } else {
+            say("? try SET INDEX or SET RELATION\n");
+        }
     } else if (same_word(cmd, "CREATE")) {
         cmd_create(args);
     } else if (same_word(cmd, "USE")) {

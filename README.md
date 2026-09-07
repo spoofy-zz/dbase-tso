@@ -43,6 +43,9 @@ It supports a compact subset of dBASE-like commands:
 - `LOCATE FOR` and `CONTINUE` search records with a saved condition.
 - `SUM` and `AVERAGE` aggregate numeric fields.
 - `ZAP` removes all records from the selected table but keeps its structure.
+- `INDEX ON field TO name` builds a simple VSAM-backed index.
+- `INDEXES`, `SET INDEX TO name`, and `SEEK value` use that index.
+- `SET RELATION TO field INTO table ON field` links parent and child tables.
 - `COPY TO ddname` exports pipe-delimited records to a DD.
 - `COUNT` reports active and physical record counts.
 - `HELP`, `QUIT`, and `EXIT` do what their names imply.
@@ -78,6 +81,8 @@ key and the remaining 960 bytes hold serialized table metadata or row data.
 Key families:
 
 - `A|table` stores the table definition.
+- `I|table|index` stores index metadata.
+- `K|table|index|value|recno` stores index entries.
 - `R|table|000001` and up store table records.
 
 The VSAM access layer uses the same `clibvsam` pattern as the MiniSQL/TSO
@@ -164,6 +169,16 @@ LOCATE FOR AGE>30
 CONTINUE
 SUM AGE
 AVERAGE AGE
+INDEX ON ID TO PID
+INDEXES
+SET INDEX TO PID
+SEEK 2
+CREATE ORDERS CUSTID N 8 ITEM C 16
+APPEND CUSTID=2 ITEM=BOOK
+APPEND CUSTID=1 ITEM=PEN
+USE PEOPLE
+SET RELATION TO ID INTO ORDERS ON CUSTID
+GO 2
 GO TOP
 SKIP 1
 DELETE 1
@@ -195,8 +210,14 @@ Record 2 replaced
 1 record(s) replaced
 Sum AGE = 104.00
 Average AGE = 34.67
+Index PID on ID built with 3 entries
+Index PID active on ID
+Relation PEOPLE.ID -> ORDERS.CUSTID active
 RECNO ID       NAME                     AGE CITY             ACTIVE
     1 1        ANA                      42  ZAGREB           .
     2 2        IVAN                     35  SPLIT            Y
+Related ORDERS:
+RECNO CUSTID   ITEM
+    1 2        BOOK
 4 active records (4 physical)
 ```
