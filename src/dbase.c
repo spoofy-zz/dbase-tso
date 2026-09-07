@@ -16,6 +16,7 @@ extern int dbtput(char *buf, int len) asm("DBTPUT");
 #define MAX_NAME 16
 #define MAX_FIELDS 12
 #define MAX_INDEXES 8
+#define MAX_WORK_AREAS 10
 #define MAX_VALUE 32
 #define MAX_ROWS 999
 #define MAX_VARS 32
@@ -66,6 +67,17 @@ struct MemVar {
     char value[MAX_VALUE + 1];
 };
 
+struct WorkArea {
+    int have_table;
+    struct Table table;
+    int recno;
+    int have_index;
+    struct IndexDef index;
+    char alias[MAX_NAME + 1];
+    char filter[MAX_LINE];
+    int deleted_on;
+};
+
 static struct Table g_table;
 static int g_have_table = 0;
 static int g_recno = 0;
@@ -75,6 +87,10 @@ static int g_locate_recno = 0;
 static struct IndexDef g_index;
 static int g_have_index = 0;
 static struct RelationDef g_relation;
+static struct WorkArea g_areas[MAX_WORK_AREAS];
+static int g_area = 0;
+static char g_filter[MAX_LINE];
+static int g_deleted_on = 1;
 static struct MemVar g_vars[MAX_VARS];
 static int g_var_count = 0;
 static int g_do_depth = 0;
@@ -153,6 +169,78 @@ static int starts_word(const char *s, const char *word)
 static int key_has_prefix(const char *key, const char *prefix, int prefix_len)
 {
     return memcmp(key, prefix, prefix_len) == 0;
+}
+
+static void save_area(void)
+{
+    struct WorkArea *a = &g_areas[g_area];
+    a->have_table = g_have_table;
+    a->table = g_table;
+    a->recno = g_recno;
+    a->have_index = g_have_index;
+    a->index = g_index;
+    strncpy(a->filter, g_filter, sizeof(a->filter));
+    a->filter[sizeof(a->filter) - 1] = '\0';
+    a->deleted_on = g_deleted_on;
+}
+
+static void load_area(void)
+{
+    struct WorkArea *a = &g_areas[g_area];
+    g_have_table = a->have_table;
+    g_table = a->table;
+    g_recno = a->recno;
+    g_have_index = a->have_index;
+    g_index = a->index;
+    strncpy(g_filter, a->filter, sizeof(g_filter));
+    g_filter[sizeof(g_filter) - 1] = '\0';
+    g_deleted_on = a->deleted_on;
+}
+
+static void init_areas(void)
+{
+    int i;
+    for (i = 0; i < MAX_WORK_AREAS; i++) {
+        memset(&g_areas[i], 0, sizeof(g_areas[i]));
+        g_areas[i].deleted_on = 1;
+    }
+    g_area = 0;
+    load_area();
+}
+
+static const char *current_alias(void)
+{
+    if (g_areas[g_area].alias[0] != '\0') {
+        return g_areas[g_area].alias;
+    }
+    if (g_have_table) {
+        return g_table.name;
+    }
+    return "";
+}
+
+static void normalize_field_ref(char *name)
+{
+    char *arrow;
+    trim(name);
+    arrow = strstr(name, "->");
+    if (arrow != NULL) {
+        char alias[MAX_NAME + 1];
+        int n = (int)(arrow - name);
+        if (n > MAX_NAME) {
+            n = MAX_NAME;
+        }
+        strncpy(alias, name, n);
+        alias[n] = '\0';
+        trim(alias);
+        upcase(alias);
+        if (!same_word(alias, current_alias())) {
+            say("? alias is not selected in current work area: %s\n", alias);
+        }
+        memmove(name, arrow + 2, strlen(arrow + 2) + 1);
+    }
+    trim(name);
+    upcase(name);
 }
 
 static int var_index(const char *name)
@@ -491,7 +579,7 @@ static void normalize_command_line(char *line)
         "DISPLAY", "REPLACE", "DELETE", "PACK", "FIND", "LOCATE",
         "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL", "TABLES",
         "COPY", "LOCATE", "CONTINUE", "SUM", "AVERAGE", "ZAP",
-        "INDEX", "INDEXES", "REINDEX", "SET", "SEEK", "RELATION", "STORE",
+        "INDEX", "INDEXES", "REINDEX", "SELECT", "SET", "SEEK", "RELATION", "STORE",
         "DO", "IF", "ELSE", "ENDIF", "WHILE", "ENDDO", NULL
     };
     int i;
@@ -1057,9 +1145,13 @@ static int get_count(const char *table)
 
 static int field_index(const char *name)
 {
+    char ref[MAX_NAME * 2 + 4];
     int i;
+    strncpy(ref, name, sizeof(ref));
+    ref[sizeof(ref) - 1] = '\0';
+    normalize_field_ref(ref);
     for (i = 0; i < g_table.field_count; i++) {
-        if (same_word(g_table.fields[i].name, name)) {
+        if (same_word(g_table.fields[i].name, ref)) {
             return i;
         }
     }
@@ -1072,6 +1164,7 @@ static int require_table(void);
 static void print_header(void);
 static void print_row(int seq, const char *row);
 static int read_row(int seq, char *row, int max);
+static int row_matches_for(const char *row, const char *expr);
 static void dispatch(char *line);
 
 static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
@@ -1080,6 +1173,20 @@ static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
     strncpy(body, row + 1, sizeof(body));
     body[sizeof(body) - 1] = '\0';
     split_values(body, vals);
+}
+
+static int row_visible(const char *row, int all, const char *forp)
+{
+    if (!all && g_deleted_on && row[0] == '*') {
+        return 0;
+    }
+    if (g_filter[0] != '\0' && !row_matches_for(row, g_filter)) {
+        return 0;
+    }
+    if (forp != NULL && forp[0] != '\0' && !row_matches_for(row, forp)) {
+        return 0;
+    }
+    return 1;
 }
 
 static void split_values_for(const struct Table *t, char *row,
@@ -1601,13 +1708,13 @@ static void cmd_help(void)
     say("  CREATE name field type len (field type len ...)\n");
     say("  Types: C char, N numeric, D date, L logical\n");
     say("  TABLES\n");
-    say("  USE name\n");
+    say("  SELECT n|alias, USE name (ALIAS alias)\n");
     say("  APPEND field=value (field=value ...)\n");
     say("  APPEND BLANK\n");
     say("  APPEND FROM ddname\n");
     say("  COPY TO ddname (ALL)\n");
-    say("  LIST (ALL) (FOR field=value)\n");
-    say("  DISPLAY, DISPLAY STRUCTURE, DISPLAY TABLES\n");
+    say("  LIST (ALL) (field-list) (FOR field=value)\n");
+    say("  DISPLAY (ALL) (field-list), DISPLAY STRUCTURE, DISPLAY TABLES\n");
     say("  REPLACE recno field=value (field=value ...)\n");
     say("  REPLACE field WITH value (FOR field op value)\n");
     say("  DELETE (recno), DELETE ALL, DELETE FOR field op value\n");
@@ -1620,6 +1727,8 @@ static void cmd_help(void)
     say("  SEEK value\n");
     say("  SET RELATION TO field INTO table ON field\n");
     say("  SET RELATION OFF, RELATION\n");
+    say("  SET FILTER TO expression, SET FILTER OFF\n");
+    say("  SET DELETED ON|OFF, DISPLAY STATUS\n");
     say("  STORE value TO var, STORE var=value, ? expression\n");
     say("  DISPLAY MEMORY, LIST MEMORY\n");
     say("  DO ddname or dataset(member) with IF/ELSE/ENDIF and DO WHILE/ENDDO\n");
@@ -1832,6 +1941,63 @@ static void cmd_set_index(char *args)
     say("Index %s active on %s\n", g_index.name, g_index.field);
 }
 
+static void cmd_set_filter(char *args)
+{
+    trim(args);
+    if (starts_word(args, "TO")) {
+        memmove(args, args + 2, strlen(args + 2) + 1);
+        trim(args);
+    }
+    if (args[0] == '\0' || same_word(args, "OFF")) {
+        g_filter[0] = '\0';
+        save_area();
+        say("Filter off\n");
+        return;
+    }
+    strncpy(g_filter, args, sizeof(g_filter));
+    g_filter[sizeof(g_filter) - 1] = '\0';
+    trim(g_filter);
+    save_area();
+    say("Filter set to %s\n", g_filter);
+}
+
+static void cmd_set_deleted(char *args)
+{
+    trim(args);
+    if (same_word(args, "ON")) {
+        g_deleted_on = 1;
+    } else if (same_word(args, "OFF")) {
+        g_deleted_on = 0;
+    } else {
+        say("? try SET DELETED ON or SET DELETED OFF\n");
+        return;
+    }
+    save_area();
+    say("Deleted %s\n", g_deleted_on ? "on" : "off");
+}
+
+static void cmd_status(void)
+{
+    int i;
+    say("Work areas:\n");
+    for (i = 0; i < MAX_WORK_AREAS; i++) {
+        struct WorkArea *a = &g_areas[i];
+        say("%c %2d ", i == g_area ? '*' : ' ', i + 1);
+        if (a->have_table) {
+            say("%-16s alias %-16s recno %d",
+                a->table.name, a->alias[0] ? a->alias : a->table.name,
+                a->recno);
+            if (a->filter[0] != '\0') {
+                say(" filter %s", a->filter);
+            }
+            say(" deleted %s", a->deleted_on ? "ON" : "OFF");
+        } else {
+            say("empty");
+        }
+        say("\n");
+    }
+}
+
 static void cmd_seek(char *args)
 {
     char prefix[KEY_LEN];
@@ -2029,17 +2195,107 @@ static void cmd_create(char *args)
     g_table = t;
     g_have_table = 1;
     g_recno = 0;
+    strncpy(g_areas[g_area].alias, t.name, MAX_NAME);
+    g_areas[g_area].alias[MAX_NAME] = '\0';
+    save_area();
     say("Table %s created with %d fields\n", t.name, t.field_count);
 }
 
 static void cmd_use(char *args)
 {
-    trim(args);
-    if (load_table(args)) {
-        say("Using %s\n", g_table.name);
-    } else {
-        say("? table not found: %s\n", args);
+    char work[MAX_LINE];
+    char upper[MAX_LINE];
+    char name[MAX_NAME + 1];
+    char alias[MAX_NAME + 1];
+    char *p;
+    char *aliasp;
+
+    strncpy(work, args, sizeof(work));
+    work[sizeof(work) - 1] = '\0';
+    trim(work);
+    alias[0] = '\0';
+    strncpy(upper, work, sizeof(upper));
+    upper[sizeof(upper) - 1] = '\0';
+    upcase(upper);
+    aliasp = strstr(upper, " ALIAS ");
+    if (aliasp != NULL) {
+        work[aliasp - upper] = '\0';
+        strncpy(alias, work + (aliasp - upper) + 7, MAX_NAME);
+        alias[MAX_NAME] = '\0';
+        trim(alias);
+        upcase(alias);
     }
+    p = strchr(work, ' ');
+    if (p != NULL) {
+        *p = '\0';
+    }
+    strncpy(name, work, MAX_NAME);
+    name[MAX_NAME] = '\0';
+    trim(name);
+    trim(args);
+    if (load_table(name)) {
+        if (alias[0] == '\0') {
+            strncpy(alias, g_table.name, MAX_NAME);
+            alias[MAX_NAME] = '\0';
+        }
+        strncpy(g_areas[g_area].alias, alias, MAX_NAME);
+        g_areas[g_area].alias[MAX_NAME] = '\0';
+        save_area();
+        say("Using %s in work area %d alias %s\n", g_table.name,
+            g_area + 1, current_alias());
+    } else {
+        say("? table not found: %s\n", name);
+    }
+}
+
+static void cmd_select(char *args)
+{
+    char target[MAX_NAME + 1];
+    int i;
+    int n;
+
+    trim(args);
+    if (args[0] == '\0') {
+        say("Work area %d", g_area + 1);
+        if (g_have_table) {
+            say(" %s alias %s", g_table.name, current_alias());
+        }
+        say("\n");
+        return;
+    }
+    strncpy(target, args, MAX_NAME);
+    target[MAX_NAME] = '\0';
+    trim(target);
+    upcase(target);
+    if (isdigit((unsigned char)target[0])) {
+        n = atoi(target);
+        if (n < 1 || n > MAX_WORK_AREAS) {
+            say("? work area must be 1 to %d\n", MAX_WORK_AREAS);
+            return;
+        }
+        save_area();
+        g_area = n - 1;
+        load_area();
+    } else {
+        for (i = 0; i < MAX_WORK_AREAS; i++) {
+            if (g_areas[i].alias[0] != '\0' &&
+                same_word(g_areas[i].alias, target)) {
+                save_area();
+                g_area = i;
+                load_area();
+                break;
+            }
+        }
+        if (i >= MAX_WORK_AREAS) {
+            say("? alias not found: %s\n", target);
+            return;
+        }
+    }
+    say("Selected work area %d", g_area + 1);
+    if (g_have_table) {
+        say(" %s alias %s", g_table.name, current_alias());
+    }
+    say("\n");
 }
 
 static int require_table(void)
@@ -2151,6 +2407,67 @@ static void print_row(int seq, const char *row)
     say("\n");
 }
 
+static int parse_field_list(char *text, int fields[MAX_FIELDS], int *count)
+{
+    char *tok;
+    *count = 0;
+    trim(text);
+    if (text[0] == '\0') {
+        return 1;
+    }
+    for (tok = strtok(text, " ,"); tok != NULL; tok = strtok(NULL, " ,")) {
+        int ix;
+        if (*count >= MAX_FIELDS) {
+            say("? too many fields in list\n");
+            return 0;
+        }
+        ix = field_index(tok);
+        if (ix < 0) {
+            say("? unknown field: %s\n", tok);
+            return 0;
+        }
+        fields[*count] = ix;
+        (*count)++;
+    }
+    return 1;
+}
+
+static void print_header_fields(const int fields[MAX_FIELDS], int field_count)
+{
+    int i;
+    if (field_count == 0) {
+        print_header();
+        return;
+    }
+    say("RECNO ");
+    for (i = 0; i < field_count; i++) {
+        int ix = fields[i];
+        say("%-*s ", g_table.fields[ix].len, g_table.fields[ix].name);
+    }
+    say("\n");
+}
+
+static void print_row_fields(int seq, const char *row,
+                             const int fields[MAX_FIELDS], int field_count)
+{
+    char tmp[DATA_LEN + 1];
+    char vals[MAX_FIELDS][MAX_VALUE + 1];
+    int i;
+    if (field_count == 0) {
+        print_row(seq, row);
+        return;
+    }
+    strncpy(tmp, row + 1, sizeof(tmp));
+    tmp[sizeof(tmp) - 1] = '\0';
+    split_values(tmp, vals);
+    say("%5d ", seq);
+    for (i = 0; i < field_count; i++) {
+        int ix = fields[i];
+        say("%-*s ", g_table.fields[ix].len, vals[ix]);
+    }
+    say("\n");
+}
+
 static void print_row_for(const struct Table *t, int seq, const char *row)
 {
     char tmp[DATA_LEN + 1];
@@ -2228,6 +2545,9 @@ static void cmd_list(char *args)
     int count;
     int all = 0;
     char *forp;
+    char field_text[MAX_LINE];
+    int fields[MAX_FIELDS];
+    int field_count = 0;
     char args_upper[MAX_LINE];
     char row[DATA_LEN + 1];
 
@@ -2235,6 +2555,14 @@ static void cmd_list(char *args)
         return;
     }
     trim(args);
+    strncpy(args_upper, args, sizeof(args_upper));
+    args_upper[sizeof(args_upper) - 1] = '\0';
+    upcase(args_upper);
+    if (starts_word(args_upper, "ALL")) {
+        all = 1;
+        memmove(args, args + 3, strlen(args + 3) + 1);
+        trim(args);
+    }
     strncpy(args_upper, args, sizeof(args_upper));
     args_upper[sizeof(args_upper) - 1] = '\0';
     upcase(args_upper);
@@ -2246,19 +2574,24 @@ static void cmd_list(char *args)
     } else {
         forp = NULL;
     }
-    if (starts_word(args_upper, "ALL")) {
-        all = 1;
-        if (forp == NULL && strlen(args) > 3) {
-            forp = args + 3;
-            trim(forp);
+    if (forp != NULL) {
+        char *cut = forp;
+        while (cut > args && isspace((unsigned char)cut[-1])) {
+            cut--;
         }
+        *cut = '\0';
+    }
+    strncpy(field_text, args, sizeof(field_text));
+    field_text[sizeof(field_text) - 1] = '\0';
+    trim(field_text);
+    if (!parse_field_list(field_text, fields, &field_count)) {
+        return;
     }
     count = get_count(g_table.name);
-    print_header();
+    print_header_fields(fields, field_count);
     for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && (all || row[0] != '*') &&
-            row_matches_for(row, forp)) {
-            print_row(i, row);
+        if (read_row(i, row, sizeof(row)) && row_visible(row, all, forp)) {
+            print_row_fields(i, row, fields, field_count);
         }
     }
 }
@@ -2267,6 +2600,7 @@ static void show_current(void)
 {
     char row[DATA_LEN + 1];
     int count;
+    int fields[MAX_FIELDS];
 
     if (!require_table()) {
         return;
@@ -2277,8 +2611,85 @@ static void show_current(void)
         say("? record pointer is out of range\n");
         return;
     }
-    print_header();
-    print_row(g_recno, row);
+    if (!row_visible(row, 0, NULL)) {
+        say("? current record is hidden by SET DELETED or SET FILTER\n");
+        return;
+    }
+    print_header_fields(fields, 0);
+    print_row_fields(g_recno, row, fields, 0);
+    show_relation_for_parent(row);
+}
+
+static void cmd_display_records(char *args)
+{
+    char args_upper[MAX_LINE];
+    char field_text[MAX_LINE];
+    char row[DATA_LEN + 1];
+    char *forp;
+    int fields[MAX_FIELDS];
+    int field_count = 0;
+    int all = 0;
+    int count;
+    int i;
+
+    if (!require_table()) {
+        return;
+    }
+    trim(args);
+    strncpy(args_upper, args, sizeof(args_upper));
+    args_upper[sizeof(args_upper) - 1] = '\0';
+    upcase(args_upper);
+    if (starts_word(args_upper, "ALL")) {
+        all = 1;
+        memmove(args, args + 3, strlen(args + 3) + 1);
+        trim(args);
+    }
+    strncpy(args_upper, args, sizeof(args_upper));
+    args_upper[sizeof(args_upper) - 1] = '\0';
+    upcase(args_upper);
+    forp = strstr(args_upper, " FOR ");
+    if (forp != NULL) {
+        forp = args + (forp - args_upper) + 1;
+    } else if (starts_word(args_upper, "FOR")) {
+        forp = args;
+    } else {
+        forp = NULL;
+    }
+    if (forp != NULL) {
+        char *cut = forp;
+        while (cut > args && isspace((unsigned char)cut[-1])) {
+            cut--;
+        }
+        *cut = '\0';
+    }
+    strncpy(field_text, args, sizeof(field_text));
+    field_text[sizeof(field_text) - 1] = '\0';
+    trim(field_text);
+    if (!parse_field_list(field_text, fields, &field_count)) {
+        return;
+    }
+    if (all || forp != NULL) {
+        count = get_count(g_table.name);
+        print_header_fields(fields, field_count);
+        for (i = 1; i <= count; i++) {
+            if (read_row(i, row, sizeof(row)) && row_visible(row, all, forp)) {
+                print_row_fields(i, row, fields, field_count);
+            }
+        }
+        return;
+    }
+    count = get_count(g_table.name);
+    if (g_recno < 1 || g_recno > count ||
+        !read_row(g_recno, row, sizeof(row))) {
+        say("? record pointer is out of range\n");
+        return;
+    }
+    if (!row_visible(row, 0, NULL)) {
+        say("? current record is hidden by SET DELETED or SET FILTER\n");
+        return;
+    }
+    print_header_fields(fields, field_count);
+    print_row_fields(g_recno, row, fields, field_count);
     show_relation_for_parent(row);
 }
 
@@ -2402,7 +2813,7 @@ static void cmd_replace(char *args)
                 }
                 continue;
             }
-            if (!row_matches_for(row, forp)) {
+            if (!row_visible(row, 0, forp)) {
                 if (!all && forp == NULL) {
                     break;
                 }
@@ -2487,7 +2898,7 @@ static void cmd_delete(char *args)
     if (all) {
         for (seq = 1; seq <= count; seq++) {
             if (read_row(seq, row, sizeof(row)) && row[0] != '*' &&
-                row_matches_for(row, forp)) {
+                row_visible(row, 1, forp)) {
                 row[0] = '*';
                 if (!write_row(seq, row)) {
                     say("? delete failed\n");
@@ -2535,6 +2946,7 @@ static void cmd_recall(char *args)
     if (all) {
         for (seq = 1; seq <= count; seq++) {
             if (read_row(seq, row, sizeof(row)) && row[0] == '*' &&
+                (g_filter[0] == '\0' || row_matches_for(row, g_filter)) &&
                 row_matches_for(row, forp)) {
                 row[0] = ' ';
                 if (!write_row(seq, row)) {
@@ -2576,7 +2988,7 @@ static void cmd_count(void)
     }
     count = get_count(g_table.name);
     for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && row[0] != '*') {
+        if (read_row(i, row, sizeof(row)) && row_visible(row, 0, NULL)) {
             active++;
         }
     }
@@ -2632,7 +3044,7 @@ static void cmd_find(char *args)
     count = get_count(g_table.name);
     print_header();
     for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && row[0] != '*') {
+        if (read_row(i, row, sizeof(row)) && row_visible(row, 0, NULL)) {
             strncpy(hay, row, sizeof(hay));
             hay[sizeof(hay) - 1] = '\0';
             upcase(hay);
@@ -2653,8 +3065,7 @@ static int locate_from(int start, const char *expr)
 
     count = get_count(g_table.name);
     for (i = start; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && row[0] != '*' &&
-            row_matches_for(row, expr)) {
+        if (read_row(i, row, sizeof(row)) && row_visible(row, 0, expr)) {
             g_recno = i;
             print_header();
             print_row(i, row);
@@ -2745,8 +3156,7 @@ static void cmd_sum(char *args, int average)
     }
     count = get_count(g_table.name);
     for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && row[0] != '*' &&
-            row_matches_for(row, forp)) {
+        if (read_row(i, row, sizeof(row)) && row_visible(row, 0, forp)) {
             row_values(row, vals);
             if (vals[ix][0] != '\0') {
                 total += atof(vals[ix]);
@@ -2915,7 +3325,7 @@ static void cmd_copy_to(char *args)
     }
     count = get_count(g_table.name);
     for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && (all || row[0] != '*')) {
+        if (read_row(i, row, sizeof(row)) && row_visible(row, all, NULL)) {
             char body[DATA_LEN + 1];
             char vals[MAX_FIELDS][MAX_VALUE + 1];
             int j;
@@ -3087,6 +3497,7 @@ static void run_script_lines(char lines[MAX_SCRIPT_LINES][MAX_LINE], int count)
         }
         expand_vars(line);
         dispatch(line);
+        save_area();
     }
 }
 
@@ -3227,6 +3638,8 @@ static void dispatch(char *line)
         cmd_question(args);
     } else if (same_word(cmd, "TABLES")) {
         cmd_tables();
+    } else if (same_word(cmd, "SELECT")) {
+        cmd_select(args);
     } else if (same_word(cmd, "STORE")) {
         cmd_store(args);
     } else if (same_word(cmd, "DO")) {
@@ -3250,8 +3663,16 @@ static void dispatch(char *line)
             memmove(args, args + 8, strlen(args + 8) + 1);
             trim(args);
             cmd_set_relation(args);
+        } else if (starts_word(args, "FILTER")) {
+            memmove(args, args + 6, strlen(args + 6) + 1);
+            trim(args);
+            cmd_set_filter(args);
+        } else if (starts_word(args, "DELETED")) {
+            memmove(args, args + 7, strlen(args + 7) + 1);
+            trim(args);
+            cmd_set_deleted(args);
         } else {
-            say("? try SET INDEX or SET RELATION\n");
+            say("? try SET INDEX, SET RELATION, SET FILTER or SET DELETED\n");
         }
     } else if (same_word(cmd, "CREATE")) {
         cmd_create(args);
@@ -3280,8 +3701,11 @@ static void dispatch(char *line)
             cmd_tables();
         } else if (same_word(args, "MEMORY")) {
             cmd_display_memory();
+        } else if (same_word(args, "STATUS")) {
+            save_area();
+            cmd_status();
         } else {
-            say("? try DISPLAY STRUCTURE, DISPLAY TABLES or DISPLAY MEMORY\n");
+            cmd_display_records(args);
         }
     } else if (same_word(cmd, "REPLACE")) {
         cmd_replace(args);
@@ -3329,6 +3753,7 @@ int main(int argc, char **argv)
     (void)argv;
 
     say("DBASE/TSO 0.1 for MVS 3.8j - type HELP\n");
+    init_areas();
     if (!kv_open()) {
         say("? cannot open DD %s. Allocate the VSAM store first.\n", DB_DD);
     }
@@ -3374,6 +3799,7 @@ int main(int argc, char **argv)
         }
         expand_vars(line);
         dispatch(line);
+        save_area();
         flush_out();
     }
 #endif

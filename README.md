@@ -23,15 +23,16 @@ It supports a compact subset of dBASE-like commands:
 - `CREATE` defines a table and its fields.
 - `CREATE` supports `C`, `N`, `D`, and `L` field types.
 - `TABLES` lists defined tables in the VSAM store.
-- `USE` selects an existing table.
+- `SELECT` changes the active work area by number or alias.
+- `USE name ALIAS alias` selects an existing table in the current work area.
 - `APPEND` inserts a record with `FIELD=value` assignments.
 - `APPEND BLANK` creates an empty record.
 - `APPEND FROM ddname` imports pipe-delimited records from a DD.
-- `LIST` displays active records.
+- `LIST field-list` displays selected fields from active records.
 - `LIST ALL` also displays records marked as deleted.
 - `LIST FOR field op value` filters records with `=`, `<>`, `!=`, `<`, `>`,
   `<=`, `>=`, `AND`, `OR`, `NOT`, and parentheses.
-- `DISPLAY` shows the current record.
+- `DISPLAY field-list` shows selected fields from the current record.
 - `DISPLAY STRUCTURE` shows the current table definition.
 - `FIND` searches all fields for text.
 - `REPLACE` changes fields in one record.
@@ -46,6 +47,8 @@ It supports a compact subset of dBASE-like commands:
 - `INDEX ON field TO name` builds a simple VSAM-backed index.
 - `INDEXES`, `REINDEX`, `SET INDEX TO name`, and `SEEK value` use indexes.
 - `SET RELATION TO field INTO table ON field` links parent and child tables.
+- `SET FILTER TO expression` restricts commands in the current work area.
+- `SET DELETED ON/OFF` hides or shows deleted records in the current work area.
 - `STORE value TO var` and `STORE var=value` define in-memory variables.
 - `&var` expands a memory variable inside later commands.
 - `? expression` prints a value or simple numeric expression.
@@ -100,6 +103,10 @@ Memory variables are process-local only. They are kept in the running TSO or
 batch address space, are useful for command files and repeated substitutions,
 and are not written to the VSAM cluster. Data tables, rows, index definitions,
 and index entries are the persistent VSAM-backed objects.
+
+Work areas are also runtime state. Each work area keeps its selected table,
+alias, record pointer, active index, filter expression, and deleted-record
+visibility. The persistent table and index contents remain in the VSAM store.
 
 The VSAM access layer uses the same `clibvsam` pattern as the MiniSQL/TSO
 project: `__vsopen`, `__vsread`, `__vswrit`, and `__vsdel`. The physical row
@@ -175,6 +182,7 @@ Example session:
 
 ```text
 CREATE PEOPLE ID N 8 NAME C 24 AGE N 3 CITY C 16 ACTIVE L 1
+USE PEOPLE ALIAS P
 TABLES
 APPEND ID=1 NAME=ANA AGE=42 CITY=ZAGREB ACTIVE=Y
 APPEND ID=2 NAME=MARKO AGE=35 CITY=SPLIT ACTIVE=Y
@@ -201,16 +209,26 @@ SEEK 22
 REPLACE 2 ID=2
 REINDEX
 SEEK 2
+SELECT 2
 CREATE ORDERS CUSTID N 8 ITEM C 16
+USE ORDERS ALIAS O
 APPEND CUSTID=2 ITEM=BOOK
 APPEND CUSTID=1 ITEM=PEN
-USE PEOPLE
+SELECT P
+DISPLAY STATUS
+SET FILTER TO ACTIVE=Y AND NOT CITY=PULA
+LIST P->NAME CITY
+DISPLAY ALL P->ID P->NAME
+SET FILTER OFF
 SET RELATION TO ID INTO ORDERS ON CUSTID
 GO 2
 GO TOP
 SKIP 1
 DELETE 1
 DELETE FOR AGE<30
+SET DELETED OFF
+LIST NAME
+SET DELETED ON
 RECALL ALL
 PACK
 QUIT
@@ -255,6 +273,7 @@ Expected output includes:
 
 ```text
 Table PEOPLE created with 5 fields
+Using PEOPLE in work area 1 alias P
 Tables:
   PEOPLE            5 fields
 Record 1 added
@@ -275,6 +294,14 @@ Index PID active on ID
 Record 2 replaced
 Record 2 replaced
 Reindexed 1 index(es), 3 entry(s)
+Selected work area 2
+Using ORDERS in work area 2 alias O
+Selected work area 1 PEOPLE alias P
+Work areas:
+Filter set to ACTIVE=Y AND NOT CITY=PULA
+RECNO NAME                     CITY
+RECNO ID       NAME
+Filter off
 Relation PEOPLE.ID -> ORDERS.CUSTID active
 RECNO ID       NAME                     AGE CITY             ACTIVE
     1 1        ANA                      42  ZAGREB           .
@@ -282,5 +309,8 @@ RECNO ID       NAME                     AGE CITY             ACTIVE
 Related ORDERS:
 RECNO CUSTID   ITEM
     1 2        BOOK
+Deleted off
+RECNO NAME
+Deleted on
 4 active records (4 physical)
 ```
