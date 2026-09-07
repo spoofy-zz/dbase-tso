@@ -290,7 +290,74 @@ static void eval_value(const char *expr, char *out, int max)
     trim(out);
 }
 
-static int eval_condition(const char *expr)
+static int has_outer_parens(const char *s)
+{
+    int depth = 0;
+    int i;
+    int n = (int)strlen(s);
+
+    if (n < 2 || s[0] != '(' || s[n - 1] != ')') {
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (s[i] == '(') {
+            depth++;
+        } else if (s[i] == ')') {
+            depth--;
+            if (depth == 0 && i < n - 1) {
+                return 0;
+            }
+        }
+        if (depth < 0) {
+            return 0;
+        }
+    }
+    return depth == 0;
+}
+
+static void strip_outer_parens(char *s)
+{
+    while (has_outer_parens(s)) {
+        int n = (int)strlen(s);
+        memmove(s, s + 1, n - 2);
+        s[n - 2] = '\0';
+        trim(s);
+    }
+}
+
+static char *find_logic_op(char *s, const char *op)
+{
+    int depth = 0;
+    int oplen = (int)strlen(op);
+    int i;
+
+    for (i = 0; s[i] != '\0'; i++) {
+        if (s[i] == '(') {
+            depth++;
+        } else if (s[i] == ')') {
+            depth--;
+        } else if (depth == 0 &&
+                   (i == 0 || isspace((unsigned char)s[i - 1])) &&
+                   (s[i + oplen] == '\0' ||
+                    isspace((unsigned char)s[i + oplen]))) {
+            int j;
+            int match = 1;
+            for (j = 0; j < oplen; j++) {
+                if (toupper((unsigned char)s[i + j]) !=
+                    toupper((unsigned char)op[j])) {
+                    match = 0;
+                    break;
+                }
+            }
+            if (match) {
+                return s + i;
+            }
+        }
+    }
+    return NULL;
+}
+
+static int eval_atom_condition(const char *expr)
 {
     char buf[MAX_LINE];
     char left[MAX_VALUE + 1];
@@ -375,6 +442,48 @@ static int eval_condition(const char *expr)
     return 0;
 }
 
+static int eval_condition(const char *expr)
+{
+    char buf[MAX_LINE];
+    char *op;
+
+    strncpy(buf, expr, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+    expand_vars(buf);
+    if (starts_word(buf, "IF")) {
+        memmove(buf, buf + 2, strlen(buf + 2) + 1);
+        trim(buf);
+    }
+    if (starts_word(buf, "WHILE")) {
+        memmove(buf, buf + 5, strlen(buf + 5) + 1);
+        trim(buf);
+    }
+    strip_outer_parens(buf);
+    op = find_logic_op(buf, "OR");
+    if (op != NULL) {
+        char right[MAX_LINE];
+        *op = '\0';
+        strncpy(right, op + 2, sizeof(right));
+        right[sizeof(right) - 1] = '\0';
+        return eval_condition(buf) || eval_condition(right);
+    }
+    op = find_logic_op(buf, "AND");
+    if (op != NULL) {
+        char right[MAX_LINE];
+        *op = '\0';
+        strncpy(right, op + 3, sizeof(right));
+        right[sizeof(right) - 1] = '\0';
+        return eval_condition(buf) && eval_condition(right);
+    }
+    if (starts_word(buf, "NOT")) {
+        memmove(buf, buf + 3, strlen(buf + 3) + 1);
+        trim(buf);
+        return !eval_condition(buf);
+    }
+    return eval_atom_condition(buf);
+}
+
 static void normalize_command_line(char *line)
 {
     static const char *cmds[] = {
@@ -382,7 +491,7 @@ static void normalize_command_line(char *line)
         "DISPLAY", "REPLACE", "DELETE", "PACK", "FIND", "LOCATE",
         "COUNT", "QUIT", "EXIT", "GO", "GOTO", "SKIP", "RECALL", "TABLES",
         "COPY", "LOCATE", "CONTINUE", "SUM", "AVERAGE", "ZAP",
-        "INDEX", "INDEXES", "SET", "SEEK", "RELATION", "STORE",
+        "INDEX", "INDEXES", "REINDEX", "SET", "SEEK", "RELATION", "STORE",
         "DO", "IF", "ELSE", "ENDIF", "WHILE", "ENDDO", NULL
     };
     int i;
@@ -962,6 +1071,7 @@ static void show_relation_for_parent(const char *parent_row);
 static int require_table(void);
 static void print_header(void);
 static void print_row(int seq, const char *row);
+static int read_row(int seq, char *row, int max);
 static void dispatch(char *line);
 
 static void row_values(const char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
@@ -1060,7 +1170,7 @@ static int compare_values(int field, const char *a, const char *op,
     return 0;
 }
 
-static int row_matches_for(const char *row, const char *expr)
+static int row_matches_atom(const char *row, const char *expr)
 {
     char buf[MAX_LINE];
     char vals[MAX_FIELDS][MAX_VALUE + 1];
@@ -1121,6 +1231,47 @@ static int row_matches_for(const char *row, const char *expr)
     }
     row_values(row, vals);
     return compare_values(ix, vals[ix], op, value);
+}
+
+static int row_matches_for(const char *row, const char *expr)
+{
+    char buf[MAX_LINE];
+    char *op;
+
+    if (expr == NULL || expr[0] == '\0') {
+        return 1;
+    }
+    strncpy(buf, expr, sizeof(buf));
+    buf[sizeof(buf) - 1] = '\0';
+    trim(buf);
+    expand_vars(buf);
+    if (starts_word(buf, "FOR")) {
+        memmove(buf, buf + 3, strlen(buf + 3) + 1);
+        trim(buf);
+    }
+    strip_outer_parens(buf);
+    op = find_logic_op(buf, "OR");
+    if (op != NULL) {
+        char right[MAX_LINE];
+        *op = '\0';
+        strncpy(right, op + 2, sizeof(right));
+        right[sizeof(right) - 1] = '\0';
+        return row_matches_for(row, buf) || row_matches_for(row, right);
+    }
+    op = find_logic_op(buf, "AND");
+    if (op != NULL) {
+        char right[MAX_LINE];
+        *op = '\0';
+        strncpy(right, op + 3, sizeof(right));
+        right[sizeof(right) - 1] = '\0';
+        return row_matches_for(row, buf) && row_matches_for(row, right);
+    }
+    if (starts_word(buf, "NOT")) {
+        memmove(buf, buf + 3, strlen(buf + 3) + 1);
+        trim(buf);
+        return !row_matches_for(row, buf);
+    }
+    return row_matches_atom(row, buf);
 }
 
 static void split_values(char *row, char vals[MAX_FIELDS][MAX_VALUE + 1])
@@ -1263,10 +1414,163 @@ static int write_index_entry(const struct IndexDef *idx, int seq,
     return kv_put(key, data);
 }
 
+struct KeyCollectCtx {
+    char (*keys)[KEY_LEN];
+    int count;
+    int max;
+};
+
+static int collect_key_cb(const char *key, const char *data, void *arg)
+{
+    struct KeyCollectCtx *ctx = (struct KeyCollectCtx *)arg;
+    (void)data;
+    if (ctx->count >= ctx->max) {
+        return 0;
+    }
+    memcpy(ctx->keys[ctx->count], key, KEY_LEN);
+    ctx->count++;
+    return 1;
+}
+
+static int delete_prefix_keys(const char *prefix, int prefix_len)
+{
+    struct KeyCollectCtx ctx;
+    int i;
+
+    ctx.max = MAX_ROWS + 32;
+    ctx.count = 0;
+    ctx.keys = (char (*)[KEY_LEN])malloc(ctx.max * KEY_LEN);
+    if (ctx.keys == NULL) {
+        say("? no memory for index cleanup\n");
+        return 0;
+    }
+    if (!kv_scan(prefix, prefix_len, collect_key_cb, &ctx)) {
+        free(ctx.keys);
+        return 0;
+    }
+    for (i = 0; i < ctx.count; i++) {
+        if (!kv_delete(ctx.keys[i])) {
+            free(ctx.keys);
+            return 0;
+        }
+    }
+    free(ctx.keys);
+    return 1;
+}
+
+static int delete_index_entries(const struct IndexDef *idx)
+{
+    char prefix[KEY_LEN];
+    char tmp[KEY_LEN + 1];
+
+    memset(prefix, ' ', sizeof(prefix));
+    sprintf(tmp, "K|%-16.16s|%-16.16s|", idx->table, idx->name);
+    memcpy(prefix, tmp, strlen(tmp));
+    return delete_prefix_keys(prefix, (int)strlen(tmp));
+}
+
+static int rebuild_index(const struct IndexDef *idx, int *entries)
+{
+    int count;
+    int i;
+    int built = 0;
+    int ix;
+    char row[DATA_LEN + 1];
+
+    ix = field_index(idx->field);
+    if (ix < 0) {
+        say("? index field missing: %s\n", idx->field);
+        return 0;
+    }
+    if (!delete_index_entries(idx)) {
+        say("? index cleanup failed rc=%d\n", g_store_rc);
+        return 0;
+    }
+    count = get_count(idx->table);
+    for (i = 1; i <= count; i++) {
+        if (read_row(i, row, sizeof(row)) && row[0] != '*') {
+            char vals[MAX_FIELDS][MAX_VALUE + 1];
+            row_values(row, vals);
+            if (vals[ix][0] == '\0') {
+                continue;
+            }
+            if (!write_index_entry(idx, i, row)) {
+                say("? index write failed rc=%d\n", g_store_rc);
+                return 0;
+            }
+            built++;
+        }
+    }
+    if (entries != NULL) {
+        *entries = built;
+    }
+    return 1;
+}
+
+struct ReindexCtx {
+    int count;
+    int entries;
+    int ok;
+    struct IndexDef indexes[MAX_INDEXES];
+};
+
+static int reindex_cb(const char *key, const char *data, void *arg)
+{
+    struct ReindexCtx *ctx = (struct ReindexCtx *)arg;
+    (void)key;
+
+    if (ctx->count >= MAX_INDEXES) {
+        return 0;
+    }
+    if (!parse_index_def(data, &ctx->indexes[ctx->count])) {
+        return 1;
+    }
+    ctx->count++;
+    return 1;
+}
+
+static int rebuild_table_indexes(int verbose)
+{
+    char prefix[KEY_LEN];
+    char tmp[KEY_LEN + 1];
+    struct ReindexCtx ctx;
+
+    if (!g_have_table) {
+        return 1;
+    }
+    memset(prefix, ' ', sizeof(prefix));
+    sprintf(tmp, "I|%-16.16s|", g_table.name);
+    memcpy(prefix, tmp, strlen(tmp));
+    ctx.count = 0;
+    ctx.entries = 0;
+    ctx.ok = 1;
+    if (!kv_scan(prefix, (int)strlen(tmp), reindex_cb, &ctx)) {
+        return 0;
+    }
+    {
+        int i;
+        for (i = 0; i < ctx.count; i++) {
+            int entries = 0;
+            if (!rebuild_index(&ctx.indexes[i], &entries)) {
+                ctx.ok = 0;
+                break;
+            }
+            ctx.entries += entries;
+        }
+    }
+    if (verbose) {
+        say("Reindexed %d index(es), %d entry(s)\n", ctx.count,
+            ctx.entries);
+    }
+    return ctx.ok;
+}
+
 static void update_active_index(int seq, const char *row)
 {
-    if (g_have_index && same_word(g_index.table, g_table.name)) {
-        write_index_entry(&g_index, seq, row);
+    (void)seq;
+    (void)row;
+    if (!rebuild_table_indexes(0)) {
+        say("? index maintenance failed\n");
     }
 }
 
@@ -1312,7 +1616,7 @@ static void cmd_help(void)
     say("  FIND text, LOCATE FOR field op value, CONTINUE\n");
     say("  SUM field (FOR field op value)\n");
     say("  AVERAGE field (FOR field op value)\n");
-    say("  INDEX ON field TO name, INDEXES, SET INDEX TO name\n");
+    say("  INDEX ON field TO name, INDEXES, REINDEX, SET INDEX TO name\n");
     say("  SEEK value\n");
     say("  SET RELATION TO field INTO table ON field\n");
     say("  SET RELATION OFF, RELATION\n");
@@ -1398,6 +1702,16 @@ static void cmd_indexes(void)
     }
 }
 
+static void cmd_reindex(void)
+{
+    if (!require_table()) {
+        return;
+    }
+    if (!rebuild_table_indexes(1)) {
+        say("? reindex failed\n");
+    }
+}
+
 static void cmd_index(char *args)
 {
     struct IndexDef idx;
@@ -1408,10 +1722,7 @@ static void cmd_index(char *args)
     char *to;
     char upper[MAX_LINE];
     int ix;
-    int i;
-    int count;
     int entries = 0;
-    char row[DATA_LEN + 1];
 
     if (!require_table()) {
         return;
@@ -1453,20 +1764,8 @@ static void cmd_index(char *args)
         say("? index metadata write failed rc=%d\n", g_store_rc);
         return;
     }
-    count = get_count(g_table.name);
-    for (i = 1; i <= count; i++) {
-        if (read_row(i, row, sizeof(row)) && row[0] != '*') {
-            char vals[MAX_FIELDS][MAX_VALUE + 1];
-            row_values(row, vals);
-            if (vals[ix][0] == '\0') {
-                continue;
-            }
-            if (!write_index_entry(&idx, i, row)) {
-                say("? index write failed rc=%d\n", g_store_rc);
-                return;
-            }
-            entries++;
-        }
+    if (!rebuild_index(&idx, &entries)) {
+        return;
     }
     g_index = idx;
     g_have_index = 1;
@@ -2198,6 +2497,7 @@ static void cmd_delete(char *args)
                 g_recno = seq;
             }
         }
+        update_active_index(0, NULL);
         say("%d record(s) deleted\n", changed);
         return;
     }
@@ -2213,6 +2513,7 @@ static void cmd_delete(char *args)
         return;
     }
     g_recno = seq;
+    update_active_index(0, NULL);
     say("Record %d deleted\n", seq);
 }
 
@@ -2244,6 +2545,7 @@ static void cmd_recall(char *args)
                 g_recno = seq;
             }
         }
+        update_active_index(0, NULL);
         say("%d record(s) recalled\n", changed);
         return;
     }
@@ -2259,6 +2561,7 @@ static void cmd_recall(char *args)
         return;
     }
     g_recno = seq;
+    update_active_index(0, NULL);
     say("Record %d recalled\n", seq);
 }
 
@@ -2307,6 +2610,7 @@ static void cmd_pack(void)
             return;
         }
     }
+    update_active_index(0, NULL);
     say("Packed %s: %d active records\n", g_table.name, dst);
 }
 
@@ -2481,6 +2785,7 @@ static void cmd_zap(void)
         deleted++;
     }
     g_recno = 0;
+    update_active_index(0, NULL);
     say("Zapped %d record(s) from %s\n", deleted, g_table.name);
 }
 
@@ -2930,6 +3235,8 @@ static void dispatch(char *line)
         cmd_index(args);
     } else if (same_word(cmd, "INDEXES")) {
         cmd_indexes();
+    } else if (same_word(cmd, "REINDEX")) {
+        cmd_reindex();
     } else if (same_word(cmd, "SEEK")) {
         cmd_seek(args);
     } else if (same_word(cmd, "RELATION")) {

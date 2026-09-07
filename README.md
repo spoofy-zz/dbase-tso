@@ -30,7 +30,7 @@ It supports a compact subset of dBASE-like commands:
 - `LIST` displays active records.
 - `LIST ALL` also displays records marked as deleted.
 - `LIST FOR field op value` filters records with `=`, `<>`, `!=`, `<`, `>`,
-  `<=`, or `>=`.
+  `<=`, `>=`, `AND`, `OR`, `NOT`, and parentheses.
 - `DISPLAY` shows the current record.
 - `DISPLAY STRUCTURE` shows the current table definition.
 - `FIND` searches all fields for text.
@@ -44,14 +44,15 @@ It supports a compact subset of dBASE-like commands:
 - `SUM` and `AVERAGE` aggregate numeric fields.
 - `ZAP` removes all records from the selected table but keeps its structure.
 - `INDEX ON field TO name` builds a simple VSAM-backed index.
-- `INDEXES`, `SET INDEX TO name`, and `SEEK value` use that index.
+- `INDEXES`, `REINDEX`, `SET INDEX TO name`, and `SEEK value` use indexes.
 - `SET RELATION TO field INTO table ON field` links parent and child tables.
 - `STORE value TO var` and `STORE var=value` define in-memory variables.
 - `&var` expands a memory variable inside later commands.
 - `? expression` prints a value or simple numeric expression.
 - `DISPLAY MEMORY` and `LIST MEMORY` show currently defined variables.
 - `DO ddname` or `DO dataset(member)` runs a command file.
-- Command files support `IF`, `ELSE`, `ENDIF`, `DO WHILE`, and `ENDDO`.
+- Command files support `IF`, `ELSE`, `ENDIF`, `DO WHILE`, `ENDDO`,
+  `AND`, `OR`, `NOT`, and parentheses in conditions.
 - `COPY TO ddname` exports pipe-delimited records to a DD.
 - `COUNT` reports active and physical record counts.
 - `HELP`, `QUIT`, and `EXIT` do what their names imply.
@@ -90,6 +91,10 @@ Key families:
 - `I|table|index` stores index metadata.
 - `K|table|index|value|recno` stores index entries.
 - `R|table|000001` and up store table records.
+
+Index entries are maintained after data changes such as `APPEND`, `REPLACE`,
+`DELETE`, `RECALL`, `PACK`, and `ZAP`. `REINDEX` rebuilds all indexes defined
+for the current table from the active rows.
 
 Memory variables are process-local only. They are kept in the running TSO or
 batch address space, are useful for command files and repeated substitutions,
@@ -183,13 +188,18 @@ STORE 0 TO LOOP
 DO IBMUSER.DBASE(SCRIPT)
 DISPLAY MEMORY
 REPLACE CITY WITH ZAGREB FOR NAME=ANA
-LOCATE FOR AGE>30
+LOCATE FOR AGE>30 AND NOT CITY=PULA
 CONTINUE
 SUM AGE
 AVERAGE AGE
 INDEX ON ID TO PID
 INDEXES
 SET INDEX TO PID
+SEEK 2
+REPLACE 2 ID=22
+SEEK 22
+REPLACE 2 ID=2
+REINDEX
 SEEK 2
 CREATE ORDERS CUSTID N 8 ITEM C 16
 APPEND CUSTID=2 ITEM=BOOK
@@ -209,12 +219,12 @@ QUIT
 Example command file, supplied as `IBMUSER.DBASE(SCRIPT)` by the deploy step:
 
 ```text
-IF &NEWNAME=IVAN
+IF &NEWNAME=IVAN AND NOT &LOOP=1
 REPLACE 2 NAME=&NEWNAME
 ELSE
 REPLACE 2 NAME=BAD
 ENDIF
-DO WHILE &LOOP<2
+DO WHILE &LOOP<2 AND &NEWNAME=IVAN
 STORE &LOOP+1 TO LOOP
 ENDDO
 ? &LOOP
@@ -262,6 +272,9 @@ Sum AGE = 104.00
 Average AGE = 34.67
 Index PID on ID built with 3 entries
 Index PID active on ID
+Record 2 replaced
+Record 2 replaced
+Reindexed 1 index(es), 3 entry(s)
 Relation PEOPLE.ID -> ORDERS.CUSTID active
 RECNO ID       NAME                     AGE CITY             ACTIVE
     1 1        ANA                      42  ZAGREB           .
